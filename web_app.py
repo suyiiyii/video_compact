@@ -60,63 +60,114 @@ def results_to_dataframe(results: list[BenchmarkResult]) -> pd.DataFrame:
     for r in results:
         encoder_config = ENCODERS.get(r.encoder, None)
         encoder_name = encoder_config.name if encoder_config else r.encoder
-        data.append({
+        row = {
             "编码器": encoder_name,
             "编码器ID": r.encoder,
             "参数名": r.param_name,
             "参数值": r.param_value,
+            # VMAF 指标
             "VMAF 平均": r.vmaf_mean,
             "VMAF 最小": r.vmaf_min,
             "VMAF 最大": r.vmaf_max,
+            # PSNR-HVS 指标
+            "PSNR-HVS 平均": getattr(r, 'psnr_hvs_mean', 0),
+            "PSNR-HVS 最小": getattr(r, 'psnr_hvs_min', 0),
+            "PSNR-HVS 最大": getattr(r, 'psnr_hvs_max', 0),
+            # SSIM 指标
+            "SSIM 平均": getattr(r, 'ssim_mean', 0),
+            "SSIM 最小": getattr(r, 'ssim_min', 0),
+            "SSIM 最大": getattr(r, 'ssim_max', 0),
+            # MS-SSIM 指标
+            "MS-SSIM 平均": getattr(r, 'ms_ssim_mean', 0),
+            "MS-SSIM 最小": getattr(r, 'ms_ssim_min', 0),
+            "MS-SSIM 最大": getattr(r, 'ms_ssim_max', 0),
+            # SNR 指标
+            "SNR 平均 (dB)": getattr(r, 'snr_mean', 0),
+            "SNR 最小 (dB)": getattr(r, 'snr_min', 0),
+            "SNR 最大 (dB)": getattr(r, 'snr_max', 0),
+            # 基本信息
             "文件大小 (MB)": r.output_size_mb,
             "压缩比 (%)": r.compression_ratio,
             "编码耗时 (秒)": r.encode_time_seconds,
-        })
+        }
+        data.append(row)
     return pd.DataFrame(data)
 
 
-def plot_vmaf_vs_param(df: pd.DataFrame):
-    """绘制 VMAF vs 参数值 曲线图"""
+# 定义可用的指标选项
+METRIC_OPTIONS = {
+    "VMAF": {"col": "VMAF 平均", "min_col": "VMAF 最小", "max_col": "VMAF 最大", "range": [0, 100], "format": ".2f"},
+    "PSNR-HVS": {"col": "PSNR-HVS 平均", "min_col": "PSNR-HVS 最小", "max_col": "PSNR-HVS 最大", "range": None, "format": ".2f"},
+    "SSIM": {"col": "SSIM 平均", "min_col": "SSIM 最小", "max_col": "SSIM 最大", "range": [0, 1], "format": ".4f"},
+    "MS-SSIM": {"col": "MS-SSIM 平均", "min_col": "MS-SSIM 最小", "max_col": "MS-SSIM 最大", "range": [0, 1], "format": ".4f"},
+    "SNR": {"col": "SNR 平均 (dB)", "min_col": "SNR 最小 (dB)", "max_col": "SNR 最大 (dB)", "range": None, "format": ".2f"},
+}
+
+
+def plot_metric_vs_param(df: pd.DataFrame, metric_name: str = "VMAF"):
+    """
+    绘制指标 vs 参数值 曲线图
+    
+    Args:
+        df: 数据框
+        metric_name: 指标名称 (VMAF, PSNR-HVS, SSIM, MS-SSIM, SNR)
+    """
+    metric_config = METRIC_OPTIONS.get(metric_name, METRIC_OPTIONS["VMAF"])
+    col = metric_config["col"]
+    min_col = metric_config["min_col"]
+    max_col = metric_config["max_col"]
+    y_range = metric_config["range"]
+    
     fig = px.line(
         df,
         x="参数值",
-        y="VMAF 平均",
+        y=col,
         color="编码器",
         markers=True,
-        title="质量参数 vs VMAF 分数",
-        labels={"参数值": "质量参数值", "VMAF 平均": "VMAF 分数"},
+        title=f"质量参数 vs {metric_name} 分数",
+        labels={"参数值": "质量参数值", col: f"{metric_name} 分数"},
     )
     
-    # 添加误差范围
-    for encoder in df["编码器"].unique():
-        encoder_df = df[df["编码器"] == encoder]
-        fig.add_trace(go.Scatter(
-            x=encoder_df["参数值"],
-            y=encoder_df["VMAF 最小"],
-            mode="lines",
-            line=dict(width=0),
-            showlegend=False,
-            hoverinfo="skip",
-        ))
-        fig.add_trace(go.Scatter(
-            x=encoder_df["参数值"],
-            y=encoder_df["VMAF 最大"],
-            mode="lines",
-            line=dict(width=0),
-            fill="tonexty",
-            fillcolor="rgba(0,100,80,0.1)",
-            showlegend=False,
-            hoverinfo="skip",
-        ))
+    # 添加误差范围（如果列存在且有有效值）
+    if min_col in df.columns and max_col in df.columns:
+        for encoder in df["编码器"].unique():
+            encoder_df = df[df["编码器"] == encoder]
+            if encoder_df[min_col].sum() > 0:  # 只在有数据时添加
+                fig.add_trace(go.Scatter(
+                    x=encoder_df["参数值"],
+                    y=encoder_df[min_col],
+                    mode="lines",
+                    line=dict(width=0),
+                    showlegend=False,
+                    hoverinfo="skip",
+                ))
+                fig.add_trace(go.Scatter(
+                    x=encoder_df["参数值"],
+                    y=encoder_df[max_col],
+                    mode="lines",
+                    line=dict(width=0),
+                    fill="tonexty",
+                    fillcolor="rgba(0,100,80,0.1)",
+                    showlegend=False,
+                    hoverinfo="skip",
+                ))
     
-    fig.update_layout(
-        xaxis_title="质量参数值 (crf)",
-        yaxis_title="VMAF 分数",
-        yaxis_range=[0, 100],
-        legend_title="编码器",
-    )
+    layout_update = {
+        "xaxis_title": "质量参数值 (crf)",
+        "yaxis_title": f"{metric_name} 分数",
+        "legend_title": "编码器",
+    }
+    if y_range:
+        layout_update["yaxis_range"] = y_range
+    
+    fig.update_layout(**layout_update)
     
     return fig
+
+
+def plot_vmaf_vs_param(df: pd.DataFrame):
+    """绘制 VMAF vs 参数值 曲线图（向后兼容）"""
+    return plot_metric_vs_param(df, "VMAF")
 
 
 def plot_vmaf_vs_size(df: pd.DataFrame):
@@ -326,12 +377,17 @@ if mode == "查看结果":
                 df = results_to_dataframe(results)
                 
                 # 显示基本信息
-                col1, col2, col3 = st.columns(3)
+                col1, col2, col3, col4 = st.columns(4)
                 with col1:
                     st.metric("测试数量", len(results))
                 with col2:
                     st.metric("最高 VMAF", f"{df['VMAF 平均'].max():.2f}")
                 with col3:
+                    if "SSIM 平均" in df.columns and df["SSIM 平均"].sum() > 0:
+                        st.metric("最高 SSIM", f"{df['SSIM 平均'].max():.4f}")
+                    else:
+                        st.metric("最高 SSIM", "N/A")
+                with col4:
                     st.metric("最小文件", f"{df['文件大小 (MB)'].min():.2f} MB")
                 
                 # 四象限图（最重要，放在最前面）
@@ -342,9 +398,24 @@ if mode == "查看结果":
                 """)
                 st.plotly_chart(plot_quadrant(df), use_container_width=True)
                 
-                # 其他曲线图
-                st.subheader("📈 VMAF vs 质量参数")
-                st.plotly_chart(plot_vmaf_vs_param(df), use_container_width=True)
+                # 指标选择器曲线图
+                st.subheader("📈 指标 vs 质量参数")
+                
+                # 检查哪些指标有数据
+                available_metrics = []
+                for metric_name, config in METRIC_OPTIONS.items():
+                    if config["col"] in df.columns and df[config["col"]].sum() > 0:
+                        available_metrics.append(metric_name)
+                
+                if available_metrics:
+                    selected_metric = st.selectbox(
+                        "选择要查看的指标",
+                        available_metrics,
+                        index=0,
+                    )
+                    st.plotly_chart(plot_metric_vs_param(df, selected_metric), use_container_width=True)
+                else:
+                    st.warning("没有可用的指标数据")
                 
                 st.subheader("📉 VMAF vs 文件大小")
                 st.plotly_chart(plot_vmaf_vs_size(df), use_container_width=True)
@@ -354,15 +425,33 @@ if mode == "查看结果":
                 
                 # 数据表格
                 st.subheader("📋 详细数据")
+                
+                # 构建格式化字典
+                format_dict = {
+                    "VMAF 平均": "{:.2f}",
+                    "VMAF 最小": "{:.2f}",
+                    "VMAF 最大": "{:.2f}",
+                    "PSNR-HVS 平均": "{:.2f}",
+                    "PSNR-HVS 最小": "{:.2f}",
+                    "PSNR-HVS 最大": "{:.2f}",
+                    "SSIM 平均": "{:.4f}",
+                    "SSIM 最小": "{:.4f}",
+                    "SSIM 最大": "{:.4f}",
+                    "MS-SSIM 平均": "{:.4f}",
+                    "MS-SSIM 最小": "{:.4f}",
+                    "MS-SSIM 最大": "{:.4f}",
+                    "SNR 平均 (dB)": "{:.2f}",
+                    "SNR 最小 (dB)": "{:.2f}",
+                    "SNR 最大 (dB)": "{:.2f}",
+                    "文件大小 (MB)": "{:.2f}",
+                    "压缩比 (%)": "{:.2f}",
+                    "编码耗时 (秒)": "{:.2f}",
+                }
+                # 只保留存在的列
+                format_dict = {k: v for k, v in format_dict.items() if k in df.columns}
+                
                 st.dataframe(
-                    df.style.format({
-                        "VMAF 平均": "{:.2f}",
-                        "VMAF 最小": "{:.2f}",
-                        "VMAF 最大": "{:.2f}",
-                        "文件大小 (MB)": "{:.2f}",
-                        "压缩比 (%)": "{:.2f}",
-                        "编码耗时 (秒)": "{:.2f}",
-                    }),
+                    df.style.format(format_dict),
                     use_container_width=True,
                 )
                 
@@ -373,12 +462,23 @@ if mode == "查看结果":
                 high_quality = df[df["VMAF 平均"] >= 90]
                 if not high_quality.empty:
                     best = high_quality.loc[high_quality["文件大小 (MB)"].idxmin()]
-                    st.success(
+                    
+                    # 构建推荐信息
+                    recommendation = (
                         f"推荐配置（VMAF ≥ 90 中最小文件）: "
                         f"**{best['编码器']}**, 参数值 **{best['参数值']}**, "
-                        f"VMAF **{best['VMAF 平均']:.2f}**, "
-                        f"大小 **{best['文件大小 (MB)']:.2f} MB**"
+                        f"VMAF **{best['VMAF 平均']:.2f}**"
                     )
+                    
+                    # 如果有其他指标，也显示
+                    if "SSIM 平均" in best and best["SSIM 平均"] > 0:
+                        recommendation += f", SSIM **{best['SSIM 平均']:.4f}**"
+                    if "SNR 平均 (dB)" in best and best["SNR 平均 (dB)"] > 0:
+                        recommendation += f", SNR **{best['SNR 平均 (dB)']:.2f} dB**"
+                    
+                    recommendation += f", 大小 **{best['文件大小 (MB)']:.2f} MB**"
+                    
+                    st.success(recommendation)
                 else:
                     st.info("没有 VMAF ≥ 90 的配置，请尝试更高的质量参数")
                 
