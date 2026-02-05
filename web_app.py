@@ -110,7 +110,7 @@ def plot_vmaf_vs_param(df: pd.DataFrame):
         ))
     
     fig.update_layout(
-        xaxis_title="质量参数值 (q:v / crf)",
+        xaxis_title="质量参数值 (crf)",
         yaxis_title="VMAF 分数",
         yaxis_range=[0, 100],
         legend_title="编码器",

@@ -3,7 +3,7 @@
 视频质量评估工具 - 核心编码和评估模块
 
 支持的编码器:
-- HEVC (VideoToolbox): 使用 -q:v 参数
+- HEVC (libx265): 使用 -crf 参数
 - AV1 (SVT-AV1): 使用 -crf 参数
 """
 
@@ -15,9 +15,6 @@ import tempfile
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Literal
-
-
 @dataclass
 class EncoderConfig:
     """编码器配置"""
@@ -31,11 +28,11 @@ class EncoderConfig:
 # 编码器配置
 ENCODERS = {
     "hevc": EncoderConfig(
-        name="HEVC (VideoToolbox)",
-        codec="hevc_videotoolbox",
-        param_name="q:v",
-        param_range=(40, 70),
-        extra_args=["-tag:v", "hvc1"],
+        name="HEVC (libx265)",
+        codec="libx265",
+        param_name="crf",
+        param_range=(20, 35),
+        extra_args=["-preset", "medium", "-tag:v", "hvc1"],
     ),
     "av1": EncoderConfig(
         name="AV1 (SVT-AV1)",
