@@ -9,6 +9,23 @@ import subprocess
 from pathlib import Path
 
 SUPPORTED_ENCODERS = ("hevc", "av1")
+VMAF_IO_MODE_CHOICES = ("auto", "fifo", "file")
+
+
+def _default_vmaf_threads() -> int:
+    raw = os.getenv("VIDEO_COMPACT_VMAF_THREADS")
+    if raw is None:
+        return max(1, os.cpu_count() or 1)
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return max(1, os.cpu_count() or 1)
+
+
+DEFAULT_VMAF_THREADS = _default_vmaf_threads()
+DEFAULT_VMAF_IO_MODE = os.getenv("VIDEO_COMPACT_VMAF_IO_MODE", "auto").strip().lower()
+if DEFAULT_VMAF_IO_MODE not in VMAF_IO_MODE_CHOICES:
+    DEFAULT_VMAF_IO_MODE = "auto"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -58,6 +75,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-strict",
         action="store_true",
         help="禁用严格模式（允许部分指标计算失败）",
+    )
+    benchmark_parser.add_argument(
+        "--vmaf-threads",
+        type=int,
+        default=DEFAULT_VMAF_THREADS,
+        help=f"VMAF 线程数（默认可用核数: {DEFAULT_VMAF_THREADS}）",
+    )
+    benchmark_parser.add_argument(
+        "--vmaf-io-mode",
+        default=DEFAULT_VMAF_IO_MODE,
+        choices=VMAF_IO_MODE_CHOICES,
+        help="VMAF 输入模式：auto(优先FIFO)、fifo(仅管道)、file(落盘Y4M)",
     )
     benchmark_parser.set_defaults(handler=cmd_benchmark)
 
@@ -139,6 +168,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="是否开启严格模式（默认 false）",
     )
+    autotune_parser.add_argument(
+        "--vmaf-threads",
+        type=int,
+        default=DEFAULT_VMAF_THREADS,
+        help=f"VMAF 线程数（默认可用核数: {DEFAULT_VMAF_THREADS}）",
+    )
+    autotune_parser.add_argument(
+        "--vmaf-io-mode",
+        default=DEFAULT_VMAF_IO_MODE,
+        choices=VMAF_IO_MODE_CHOICES,
+        help="VMAF 输入模式：auto(优先FIFO)、fifo(仅管道)、file(落盘Y4M)",
+    )
     autotune_parser.set_defaults(handler=cmd_autotune)
 
     return parser
@@ -168,6 +209,8 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
     print(f"编码器: {', '.join(args.encoders)}")
     print(f"参数步长: {args.step}")
     print(f"严格模式: {'是' if strict_mode else '否'}")
+    print(f"VMAF 线程: {max(1, args.vmaf_threads)}")
+    print(f"VMAF I/O 模式: {args.vmaf_io_mode}")
 
     try:
         results = run_benchmark(
@@ -176,6 +219,8 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
             args.encoders,
             args.step,
             strict_mode,
+            vmaf_threads=max(1, args.vmaf_threads),
+            vmaf_io_mode=args.vmaf_io_mode,
         )
     except RuntimeError as exc:
         print(f"\n错误: {exc}")
@@ -291,6 +336,8 @@ def cmd_autotune(args: argparse.Namespace) -> int:
     print(f"粗扫缩放宽度: {args.coarse_scale}")
     print(f"并发数: {args.jobs}")
     print(f"严格模式: {'是' if args.strict else '否'}")
+    print(f"VMAF 线程: {max(1, args.vmaf_threads)}")
+    print(f"VMAF I/O 模式: {args.vmaf_io_mode}")
     print(f"输出目录: {args.output}")
 
     try:
@@ -302,6 +349,8 @@ def cmd_autotune(args: argparse.Namespace) -> int:
             coarse_duration=args.coarse_duration,
             coarse_scale=args.coarse_scale,
             strict_mode=args.strict,
+            vmaf_threads=max(1, args.vmaf_threads),
+            vmaf_io_mode=args.vmaf_io_mode,
             jobs=args.jobs,
             progress_cb=_print_autotune_progress,
         )

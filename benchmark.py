@@ -29,7 +29,34 @@ from typing import Any
 
 import numpy as np
 
-DEFAULT_VMAF_THREADS = int(os.getenv("VIDEO_COMPACT_VMAF_THREADS", "8"))
+VMAF_IO_MODES = {"auto", "fifo", "file"}
+
+
+def _available_cpu_count() -> int:
+    """获取当前进程可用 CPU 数量。"""
+    try:
+        affinity = os.sched_getaffinity(0)
+        if affinity:
+            return len(affinity)
+    except (AttributeError, OSError):
+        pass
+    return os.cpu_count() or 1
+
+
+def _resolve_default_vmaf_threads() -> int:
+    raw = os.getenv("VIDEO_COMPACT_VMAF_THREADS")
+    if raw is None:
+        return max(1, _available_cpu_count())
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return max(1, _available_cpu_count())
+
+
+DEFAULT_VMAF_THREADS = _resolve_default_vmaf_threads()
+DEFAULT_VMAF_IO_MODE = os.getenv("VIDEO_COMPACT_VMAF_IO_MODE", "auto").strip().lower()
+if DEFAULT_VMAF_IO_MODE not in VMAF_IO_MODES:
+    DEFAULT_VMAF_IO_MODE = "auto"
 DEFAULT_ENCODE_TIMEOUT_SECONDS = int(
     os.getenv("VIDEO_COMPACT_ENCODE_TIMEOUT_SECONDS", "7200")
 )
@@ -232,25 +259,64 @@ def _convert_to_y4m(
     run_command(cmd, timeout_seconds=timeout_seconds, context=context)
 
 
-def calculate_vmaf(
+def _normalize_vmaf_io_mode(io_mode: str | None) -> str:
+    mode = (io_mode or DEFAULT_VMAF_IO_MODE).strip().lower()
+    if mode not in VMAF_IO_MODES:
+        raise ValueError(f"未知 VMAF I/O 模式: {mode}")
+    return mode
+
+
+def _ensure_parent_dir(path: str) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def _build_vmaf_command(
     reference_path: str,
     distorted_path: str,
     output_json: str,
     *,
-    vmaf_timeout_seconds: int = DEFAULT_VMAF_TIMEOUT_SECONDS,
-    prep_timeout_seconds: int = DEFAULT_PREP_TIMEOUT_SECONDS,
-) -> dict[str, Any]:
-    """
-    以受控流程计算 VMAF 及相关指标，避免 FIFO 管道死锁。
+    vmaf_threads: int,
+) -> list[str]:
+    return [
+        "vmaf",
+        "-r",
+        reference_path,
+        "-d",
+        distorted_path,
+        "--json",
+        "-o",
+        output_json,
+        "--threads",
+        str(max(1, vmaf_threads)),
+        "--feature",
+        "psnr_hvs",
+        "--feature",
+        "float_ssim",
+        "--feature",
+        "float_ms_ssim",
+    ]
 
-    计算指标:
-    - VMAF
-    - PSNR-HVS
-    - SSIM (float_ssim)
-    - MS-SSIM (float_ms_ssim)
-    """
-    os.makedirs(os.path.dirname(output_json), exist_ok=True)
 
+def _collect_process_output(proc: subprocess.Popen[Any]) -> tuple[str, str]:
+    try:
+        stdout, stderr = proc.communicate(timeout=0.1)
+    except subprocess.TimeoutExpired:
+        _kill_process(proc)
+        stdout, stderr = proc.communicate()
+    return (stdout or "", stderr or "")
+
+
+def _run_vmaf_via_files(
+    reference_path: str,
+    distorted_path: str,
+    output_json: str,
+    *,
+    vmaf_threads: int,
+    vmaf_timeout_seconds: int,
+    prep_timeout_seconds: int,
+) -> None:
     with tempfile.TemporaryDirectory(prefix="video_compact_vmaf_") as tmpdir:
         ref_y4m = os.path.join(tmpdir, "ref.y4m")
         dist_y4m = os.path.join(tmpdir, "dist.y4m")
@@ -268,28 +334,187 @@ def calculate_vmaf(
             context="失真视频转 Y4M",
         )
 
-        vmaf_cmd = [
-            "vmaf",
-            "-r",
-            ref_y4m,
-            "-d",
-            dist_y4m,
-            "--json",
-            "-o",
-            output_json,
-            "--threads",
-            str(DEFAULT_VMAF_THREADS),
-            "--feature",
-            "psnr_hvs",
-            "--feature",
-            "float_ssim",
-            "--feature",
-            "float_ms_ssim",
-        ]
         run_command(
-            vmaf_cmd,
+            _build_vmaf_command(
+                ref_y4m,
+                dist_y4m,
+                output_json,
+                vmaf_threads=vmaf_threads,
+            ),
             timeout_seconds=vmaf_timeout_seconds,
             context="VMAF 计算",
+        )
+
+
+def _run_vmaf_via_fifo(
+    reference_path: str,
+    distorted_path: str,
+    output_json: str,
+    *,
+    vmaf_threads: int,
+    vmaf_timeout_seconds: int,
+) -> None:
+    with tempfile.TemporaryDirectory(prefix="video_compact_vmaf_fifo_") as tmpdir:
+        ref_fifo = os.path.join(tmpdir, "ref.y4m.fifo")
+        dist_fifo = os.path.join(tmpdir, "dist.y4m.fifo")
+        os.mkfifo(ref_fifo)
+        os.mkfifo(dist_fifo)
+
+        vmaf_cmd = _build_vmaf_command(
+            ref_fifo,
+            dist_fifo,
+            output_json,
+            vmaf_threads=vmaf_threads,
+        )
+        ref_cmd = [
+            *_ffmpeg_common_prefix(),
+            "-i",
+            reference_path,
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "yuv4mpegpipe",
+            ref_fifo,
+        ]
+        dist_cmd = [
+            *_ffmpeg_common_prefix(),
+            "-i",
+            distorted_path,
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "yuv4mpegpipe",
+            dist_fifo,
+        ]
+
+        proc_items: list[tuple[str, list[str], subprocess.Popen[Any]]] = []
+        started = time.monotonic()
+
+        try:
+            vmaf_proc = subprocess.Popen(
+                vmaf_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            proc_items.append(("vmaf", vmaf_cmd, vmaf_proc))
+
+            ref_proc = subprocess.Popen(
+                ref_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            proc_items.append(("ffmpeg_ref", ref_cmd, ref_proc))
+
+            dist_proc = subprocess.Popen(
+                dist_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            proc_items.append(("ffmpeg_dist", dist_cmd, dist_proc))
+        except Exception as exc:  # noqa: BLE001
+            for _, _, proc in proc_items:
+                _kill_process(proc)
+            raise CommandExecutionError(f"VMAF FIFO 模式启动失败: {exc}") from exc
+
+        while True:
+            if time.monotonic() - started > vmaf_timeout_seconds:
+                for _, _, proc in proc_items:
+                    _kill_process(proc)
+                raise CommandExecutionError(f"VMAF FIFO 计算超时（>{vmaf_timeout_seconds}s）")
+
+            status_map = {name: proc.poll() for name, _, proc in proc_items}
+            if status_map["vmaf"] is not None:
+                if status_map["vmaf"] != 0:
+                    break
+                # vmaf 退出后，允许编码进程在短时间内自行收尾。
+                grace_deadline = time.monotonic() + 3
+                while time.monotonic() < grace_deadline:
+                    if status_map["ffmpeg_ref"] is not None and status_map["ffmpeg_dist"] is not None:
+                        break
+                    time.sleep(0.1)
+                    status_map = {name: proc.poll() for name, _, proc in proc_items}
+                break
+
+            if (
+                status_map["ffmpeg_ref"] is not None and status_map["ffmpeg_ref"] != 0
+            ) or (
+                status_map["ffmpeg_dist"] is not None and status_map["ffmpeg_dist"] != 0
+            ):
+                break
+
+            time.sleep(0.2)
+
+        errors: list[str] = []
+        for name, cmd, proc in proc_items:
+            if proc.poll() is None:
+                _kill_process(proc)
+            stdout, stderr = _collect_process_output(proc)
+            if proc.returncode != 0:
+                detail = _tail(stderr or stdout or "<empty stdout/stderr>")
+                errors.append(
+                    f"{name} 失败（exit={proc.returncode}）：{detail}\n命令: {' '.join(cmd)}"
+                )
+
+        if errors:
+            raise CommandExecutionError("VMAF FIFO 计算失败:\n" + "\n".join(errors))
+
+
+def calculate_vmaf(
+    reference_path: str,
+    distorted_path: str,
+    output_json: str,
+    *,
+    vmaf_timeout_seconds: int = DEFAULT_VMAF_TIMEOUT_SECONDS,
+    prep_timeout_seconds: int = DEFAULT_PREP_TIMEOUT_SECONDS,
+    vmaf_threads: int = DEFAULT_VMAF_THREADS,
+    io_mode: str | None = None,
+    warnings: list[str] | None = None,
+) -> dict[str, Any]:
+    """
+    以受控流程计算 VMAF 及相关指标。
+
+    计算指标:
+    - VMAF
+    - PSNR-HVS
+    - SSIM (float_ssim)
+    - MS-SSIM (float_ms_ssim)
+    """
+    _ensure_parent_dir(output_json)
+    mode = _normalize_vmaf_io_mode(io_mode)
+
+    if mode in {"auto", "fifo"}:
+        try:
+            _run_vmaf_via_fifo(
+                reference_path,
+                distorted_path,
+                output_json,
+                vmaf_threads=vmaf_threads,
+                vmaf_timeout_seconds=vmaf_timeout_seconds,
+            )
+        except CommandExecutionError as exc:
+            if mode == "fifo":
+                raise
+            if warnings is not None:
+                warnings.append(f"VMAF FIFO 模式失败，已回退文件模式: {exc}")
+            _run_vmaf_via_files(
+                reference_path,
+                distorted_path,
+                output_json,
+                vmaf_threads=vmaf_threads,
+                vmaf_timeout_seconds=vmaf_timeout_seconds,
+                prep_timeout_seconds=prep_timeout_seconds,
+            )
+    else:
+        _run_vmaf_via_files(
+            reference_path,
+            distorted_path,
+            output_json,
+            vmaf_threads=vmaf_threads,
+            vmaf_timeout_seconds=vmaf_timeout_seconds,
+            prep_timeout_seconds=prep_timeout_seconds,
         )
 
     with open(output_json, "r", encoding="utf-8") as f:
@@ -503,6 +728,9 @@ def run_single_benchmark(
     encoder_key: str,
     param_value: int,
     strict_mode: bool = True,
+    *,
+    vmaf_threads: int = DEFAULT_VMAF_THREADS,
+    vmaf_io_mode: str | None = None,
 ) -> BenchmarkResult:
     """
     运行单次编码评估
@@ -538,7 +766,14 @@ def run_single_benchmark(
     output_size = os.path.getsize(output_path) / (1024 * 1024)
 
     print("  计算质量指标 (VMAF/PSNR-HVS/SSIM/MS-SSIM)...")
-    vmaf_result = calculate_vmaf(input_path, output_path, vmaf_json)
+    vmaf_result = calculate_vmaf(
+        input_path,
+        output_path,
+        vmaf_json,
+        vmaf_threads=vmaf_threads,
+        io_mode=vmaf_io_mode,
+        warnings=warnings,
+    )
     all_scores = extract_vmaf_scores(vmaf_result)
 
     print("  计算 SNR...")
@@ -582,6 +817,9 @@ def run_benchmark(
     encoders: list[str],
     param_step: int = 5,
     strict_mode: bool = True,
+    *,
+    vmaf_threads: int = DEFAULT_VMAF_THREADS,
+    vmaf_io_mode: str | None = None,
 ) -> list[BenchmarkResult]:
     """
     批量运行编码评估
@@ -611,7 +849,13 @@ def run_benchmark(
         for param_value in range(config.param_range[0], config.param_range[1] + 1, param_step):
             try:
                 result = run_single_benchmark(
-                    input_path, output_dir, encoder_key, param_value, strict_mode
+                    input_path,
+                    output_dir,
+                    encoder_key,
+                    param_value,
+                    strict_mode,
+                    vmaf_threads=vmaf_threads,
+                    vmaf_io_mode=vmaf_io_mode,
                 )
                 results.append(result)
                 summary = (
@@ -683,6 +927,18 @@ def main():
         action="store_true",
         help="禁用严格模式（允许部分指标计算失败）",
     )
+    parser.add_argument(
+        "--vmaf-threads",
+        type=int,
+        default=DEFAULT_VMAF_THREADS,
+        help=f"VMAF 线程数（默认可用核数: {DEFAULT_VMAF_THREADS}）",
+    )
+    parser.add_argument(
+        "--vmaf-io-mode",
+        default=DEFAULT_VMAF_IO_MODE,
+        choices=sorted(VMAF_IO_MODES),
+        help="VMAF 输入模式：auto(优先FIFO)、fifo(仅管道)、file(落盘Y4M)",
+    )
     
     args = parser.parse_args()
     
@@ -703,6 +959,8 @@ def main():
     print(f"编码器: {', '.join(args.encoders)}")
     print(f"参数步长: {args.step}")
     print(f"严格模式: {'是' if strict_mode else '否'}")
+    print(f"VMAF线程: {max(1, args.vmaf_threads)}")
+    print(f"VMAF I/O模式: {_normalize_vmaf_io_mode(args.vmaf_io_mode)}")
     
     # 运行评估
     try:
@@ -712,6 +970,8 @@ def main():
             args.encoders,
             args.step,
             strict_mode,
+            vmaf_threads=max(1, args.vmaf_threads),
+            vmaf_io_mode=args.vmaf_io_mode,
         )
     except RuntimeError as e:
         print(f"\n错误: {e}")

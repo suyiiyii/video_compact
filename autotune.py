@@ -12,9 +12,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from benchmark import (
+    DEFAULT_VMAF_IO_MODE,
+    DEFAULT_VMAF_THREADS,
     ENCODERS,
     BenchmarkResult,
     CommandExecutionError,
+    VMAF_IO_MODES,
     run_command,
     run_single_benchmark,
 )
@@ -44,6 +47,8 @@ class StageTask:
     encoder: str
     crf: int
     strict_mode: bool
+    vmaf_threads: int
+    vmaf_io_mode: str
 
 
 def _emit_progress(callback: ProgressCallback | None, event: dict[str, Any]) -> None:
@@ -126,6 +131,8 @@ def _evaluate_task(task: StageTask) -> dict[str, Any]:
             task.encoder,
             task.crf,
             strict_mode=task.strict_mode,
+            vmaf_threads=task.vmaf_threads,
+            vmaf_io_mode=task.vmaf_io_mode,
         )
         return _to_candidate(task.stage, result)
     except Exception as exc:  # noqa: BLE001
@@ -147,6 +154,8 @@ def _run_stage(
     encoder: str,
     crf_values: list[int],
     strict_mode: bool,
+    vmaf_threads: int,
+    vmaf_io_mode: str,
     jobs: int,
     progress_cb: ProgressCallback | None,
 ) -> list[dict[str, Any]]:
@@ -160,6 +169,8 @@ def _run_stage(
             encoder=encoder,
             crf=crf,
             strict_mode=strict_mode,
+            vmaf_threads=vmaf_threads,
+            vmaf_io_mode=vmaf_io_mode,
         )
         for crf in crf_values
     ]
@@ -339,6 +350,8 @@ def run_autotune(
     coarse_duration: int = 10,
     coarse_scale: int = 1280,
     strict_mode: bool = False,
+    vmaf_threads: int = DEFAULT_VMAF_THREADS,
+    vmaf_io_mode: str = DEFAULT_VMAF_IO_MODE,
     jobs: int = 1,
     progress_cb: ProgressCallback | None = None,
 ) -> dict[str, Any]:
@@ -350,6 +363,12 @@ def run_autotune(
     for encoder in encoders:
         if encoder not in ENCODERS:
             raise ValueError(f"不支持的编码器: {encoder}")
+    if vmaf_threads < 1:
+        raise ValueError("vmaf_threads 必须 >= 1")
+    normalized_mode = vmaf_io_mode.strip().lower()
+    if normalized_mode not in VMAF_IO_MODES:
+        raise ValueError(f"不支持的 vmaf_io_mode: {vmaf_io_mode}")
+    vmaf_io_mode = normalized_mode
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     run_dir = Path(output_root) / f"run_{timestamp}"
@@ -364,6 +383,8 @@ def run_autotune(
             "coarse_duration": coarse_duration,
             "coarse_scale": coarse_scale,
             "strict_mode": strict_mode,
+            "vmaf_threads": vmaf_threads,
+            "vmaf_io_mode": vmaf_io_mode,
             "jobs": jobs,
             "coarse_grid": {k: v for k, v in COARSE_GRID.items() if k in encoders},
             "fine_span": {k: v for k, v in FINE_SPAN.items() if k in encoders},
@@ -433,6 +454,8 @@ def run_autotune(
                 encoder=encoder,
                 crf_values=COARSE_GRID[encoder],
                 strict_mode=strict_mode,
+                vmaf_threads=vmaf_threads,
+                vmaf_io_mode=vmaf_io_mode,
                 jobs=jobs,
                 progress_cb=progress_cb,
             )
@@ -454,6 +477,8 @@ def run_autotune(
                     encoder=encoder,
                     crf_values=fine_grid,
                     strict_mode=strict_mode,
+                    vmaf_threads=vmaf_threads,
+                    vmaf_io_mode=vmaf_io_mode,
                     jobs=jobs,
                     progress_cb=progress_cb,
                 )

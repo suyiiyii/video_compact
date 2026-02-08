@@ -498,6 +498,8 @@ def start_autotune_task(
     output_root: str,
     jobs: int,
     strict_mode: bool,
+    vmaf_threads: int,
+    vmaf_io_mode: str,
 ) -> None:
     root = Path(output_root)
     root.mkdir(parents=True, exist_ok=True)
@@ -521,6 +523,10 @@ def start_autotune_task(
         "--jobs",
         str(jobs),
         "--strict" if strict_mode else "--no-strict",
+        "--vmaf-threads",
+        str(vmaf_threads),
+        "--vmaf-io-mode",
+        vmaf_io_mode,
     ]
 
     with log_path.open("w", encoding="utf-8") as logfile:
@@ -817,6 +823,17 @@ else:
         )
         jobs = st.number_input("并发任务数", min_value=1, max_value=8, value=1)
         strict_mode = st.checkbox("严格模式", value=False)
+        vmaf_threads = st.number_input(
+            "VMAF 线程数",
+            min_value=1,
+            max_value=max(1, os.cpu_count() or 1),
+            value=max(1, os.cpu_count() or 1),
+        )
+        vmaf_io_mode = st.selectbox(
+            "VMAF I/O 模式",
+            ["auto", "fifo", "file"],
+            index=0,
+        )
 
     output_root = st.text_input("输出目录", value="results_autotune")
 
@@ -832,6 +849,8 @@ else:
             output_root=output_root,
             jobs=int(jobs),
             strict_mode=strict_mode,
+            vmaf_threads=int(vmaf_threads),
+            vmaf_io_mode=vmaf_io_mode,
         )
         st.rerun()
 

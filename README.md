@@ -36,6 +36,7 @@ pip install -e .
 uv run python main.py benchmark video.mp4
 uv run python main.py benchmark video.mp4 -e hevc av1 -s 5 -o results
 uv run python main.py benchmark video.mp4 --no-strict
+uv run python main.py benchmark video.mp4 --vmaf-threads 24 --vmaf-io-mode fifo
 ```
 
 ### 2) 自动筛选参数
@@ -43,6 +44,7 @@ uv run python main.py benchmark video.mp4 --no-strict
 ```bash
 uv run python main.py autotune sample1.mp4 sample2.mp4
 uv run python main.py autotune sample1.mp4 sample2.mp4 --target-vmaf 95 --coarse-duration 10 --coarse-scale 1280 --jobs 2
+uv run python main.py autotune sample1.mp4 sample2.mp4 --vmaf-threads 24 --vmaf-io-mode auto
 ```
 
 默认策略：
@@ -54,6 +56,8 @@ uv run python main.py autotune sample1.mp4 sample2.mp4 --target-vmaf 95 --coarse
 - 精扫范围：
   - HEVC: 粗扫最优 `±2`
   - AV1: 粗扫最优 `±3`
+- VMAF 线程：默认取当前进程可用 CPU 核数（可用 `--vmaf-threads` 覆盖）
+- VMAF I/O：默认 `auto`（优先 FIFO 管道，不落盘；失败自动回退 `file`）
 
 ### 3) 启动可视化
 
