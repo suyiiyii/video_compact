@@ -14,20 +14,42 @@
 - SNR: Signal-to-Noise Ratio
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
+import selectors
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass, asdict, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any
 
 import numpy as np
+
+DEFAULT_VMAF_THREADS = int(os.getenv("VIDEO_COMPACT_VMAF_THREADS", "8"))
+DEFAULT_ENCODE_TIMEOUT_SECONDS = int(
+    os.getenv("VIDEO_COMPACT_ENCODE_TIMEOUT_SECONDS", "7200")
+)
+DEFAULT_VMAF_TIMEOUT_SECONDS = int(
+    os.getenv("VIDEO_COMPACT_VMAF_TIMEOUT_SECONDS", "1800")
+)
+DEFAULT_PREP_TIMEOUT_SECONDS = int(
+    os.getenv("VIDEO_COMPACT_PREP_TIMEOUT_SECONDS", "1800")
+)
+DEFAULT_SNR_TIMEOUT_SECONDS = int(os.getenv("VIDEO_COMPACT_SNR_TIMEOUT_SECONDS", "1800"))
+
+
+class CommandExecutionError(RuntimeError):
+    """统一命令执行异常，带上下文和 stderr 摘要。"""
+
+
 @dataclass
 class EncoderConfig:
     """编码器配置"""
+
     name: str
     codec: str
     param_name: str
@@ -57,6 +79,7 @@ ENCODERS = {
 @dataclass
 class BenchmarkResult:
     """单次评估结果"""
+
     encoder: str
     param_name: str
     param_value: int
@@ -91,17 +114,65 @@ class BenchmarkResult:
     snr_min: float = 0.0
     snr_max: float = 0.0
     snr_harmonic_mean: float = 0.0
+    # 可选诊断信息
+    warnings: list[str] | None = field(default=None)
+    error: str | None = None
 
 
-def get_video_info(video_path: str) -> dict:
+def _tail(text: str, limit: int = 1600) -> str:
+    """截断长日志，避免错误信息过长。"""
+    if len(text) <= limit:
+        return text
+    return text[-limit:]
+
+
+def run_command(
+    cmd: list[str],
+    *,
+    timeout_seconds: int | None,
+    context: str,
+) -> subprocess.CompletedProcess[str]:
+    """统一执行外部命令，并在异常时给出可诊断上下文。"""
+    try:
+        result = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise CommandExecutionError(
+            f"{context} 超时（>{timeout_seconds}s）：{' '.join(cmd)}"
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise CommandExecutionError(f"{context} 执行失败：{exc}") from exc
+
+    if result.returncode != 0:
+        stderr_tail = _tail(result.stderr or "<empty stderr>")
+        raise CommandExecutionError(
+            f"{context} 失败（exit={result.returncode}）：{stderr_tail}"
+        )
+    return result
+
+
+def _ffmpeg_common_prefix() -> list[str]:
+    return ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+
+
+def get_video_info(video_path: str) -> dict[str, Any]:
     """获取视频信息"""
     cmd = [
-        "ffprobe", "-v", "quiet",
-        "-print_format", "json",
-        "-show_format", "-show_streams",
-        video_path
+        "ffprobe",
+        "-v",
+        "quiet",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+        video_path,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = run_command(cmd, timeout_seconds=60, context="读取视频信息")
     return json.loads(result.stdout)
 
 
@@ -110,164 +181,217 @@ def encode_video(
     output_path: str,
     encoder_key: str,
     param_value: int,
+    *,
+    timeout_seconds: int = DEFAULT_ENCODE_TIMEOUT_SECONDS,
 ) -> float:
     """
-    使用指定编码器和参数编码视频
-    
+    使用指定编码器和参数编码视频。
+
     返回: 编码耗时（秒）
     """
     config = ENCODERS[encoder_key]
-    
+
     cmd = [
-        "ffmpeg", "-y",
-        "-i", input_path,
-        "-c:v", config.codec,
-        f"-{config.param_name}", str(param_value),
+        *_ffmpeg_common_prefix(),
+        "-i",
+        input_path,
+        "-c:v",
+        config.codec,
+        f"-{config.param_name}",
+        str(param_value),
         *config.extra_args,
-        output_path
+        output_path,
     ]
-    
-    start_time = time.time()
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    encode_time = time.time() - start_time
-    
-    if result.returncode != 0:
-        raise RuntimeError(f"编码失败: {result.stderr}")
-    
-    return encode_time
+
+    started = time.monotonic()
+    run_command(
+        cmd,
+        timeout_seconds=timeout_seconds,
+        context=f"编码失败（encoder={encoder_key}, {config.param_name}={param_value}）",
+    )
+    return time.monotonic() - started
 
 
-def calculate_vmaf(reference_path: str, distorted_path: str, output_json: str) -> dict:
+def _convert_to_y4m(
+    input_path: str,
+    output_path: str,
+    *,
+    timeout_seconds: int,
+    context: str,
+) -> None:
+    cmd = [
+        *_ffmpeg_common_prefix(),
+        "-i",
+        input_path,
+        "-pix_fmt",
+        "yuv420p",
+        "-f",
+        "yuv4mpegpipe",
+        output_path,
+    ]
+    run_command(cmd, timeout_seconds=timeout_seconds, context=context)
+
+
+def calculate_vmaf(
+    reference_path: str,
+    distorted_path: str,
+    output_json: str,
+    *,
+    vmaf_timeout_seconds: int = DEFAULT_VMAF_TIMEOUT_SECONDS,
+    prep_timeout_seconds: int = DEFAULT_PREP_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
     """
-    使用命名管道计算 VMAF 及相关指标（避免生成大文件）
-    
-    计算的指标:
+    以受控流程计算 VMAF 及相关指标，避免 FIFO 管道死锁。
+
+    计算指标:
     - VMAF
     - PSNR-HVS
     - SSIM (float_ssim)
     - MS-SSIM (float_ms_ssim)
-    
-    返回: VMAF 结果字典
     """
-    # 创建临时命名管道
-    with tempfile.TemporaryDirectory() as tmpdir:
-        ref_pipe = os.path.join(tmpdir, "ref.y4m")
-        dist_pipe = os.path.join(tmpdir, "dist.y4m")
-        
-        os.mkfifo(ref_pipe)
-        os.mkfifo(dist_pipe)
-        
-        # 启动 ffmpeg 进程输出到管道
-        ref_proc = subprocess.Popen(
-            ["ffmpeg", "-i", reference_path, "-pix_fmt", "yuv420p", 
-             "-f", "yuv4mpegpipe", ref_pipe, "-y"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+    os.makedirs(os.path.dirname(output_json), exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="video_compact_vmaf_") as tmpdir:
+        ref_y4m = os.path.join(tmpdir, "ref.y4m")
+        dist_y4m = os.path.join(tmpdir, "dist.y4m")
+
+        _convert_to_y4m(
+            reference_path,
+            ref_y4m,
+            timeout_seconds=prep_timeout_seconds,
+            context="参考视频转 Y4M",
         )
-        
-        dist_proc = subprocess.Popen(
-            ["ffmpeg", "-i", distorted_path, "-pix_fmt", "yuv420p",
-             "-f", "yuv4mpegpipe", dist_pipe, "-y"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+        _convert_to_y4m(
+            distorted_path,
+            dist_y4m,
+            timeout_seconds=prep_timeout_seconds,
+            context="失真视频转 Y4M",
         )
-        
-        # 运行 vmaf，添加额外特征计算
-        vmaf_result = subprocess.run(
-            [
-                "vmaf", "-r", ref_pipe, "-d", dist_pipe,
-                "--json", "-o", output_json, "--threads", "8",
-                "--feature", "psnr_hvs",
-                "--feature", "float_ssim",
-                "--feature", "float_ms_ssim",
-            ],
-            capture_output=True,
-            text=True,
+
+        vmaf_cmd = [
+            "vmaf",
+            "-r",
+            ref_y4m,
+            "-d",
+            dist_y4m,
+            "--json",
+            "-o",
+            output_json,
+            "--threads",
+            str(DEFAULT_VMAF_THREADS),
+            "--feature",
+            "psnr_hvs",
+            "--feature",
+            "float_ssim",
+            "--feature",
+            "float_ms_ssim",
+        ]
+        run_command(
+            vmaf_cmd,
+            timeout_seconds=vmaf_timeout_seconds,
+            context="VMAF 计算",
         )
-        
-        # 等待 ffmpeg 进程结束
-        ref_proc.wait()
-        dist_proc.wait()
-        
-        if vmaf_result.returncode != 0:
-            raise RuntimeError(f"VMAF 计算失败: {vmaf_result.stderr}")
-    
-    # 读取结果
-    with open(output_json, "r") as f:
+
+    with open(output_json, "r", encoding="utf-8") as f:
         result = json.load(f)
-    
     return result
 
 
-def extract_vmaf_scores(vmaf_result: dict) -> dict:
+def extract_vmaf_scores(vmaf_result: dict[str, Any]) -> dict[str, float]:
     """从 VMAF 结果中提取所有指标分数"""
     pooled_metrics = vmaf_result.get("pooled_metrics", {})
-    
-    def extract_metric(metric_name: str, prefix: str) -> dict:
-        """提取单个指标的统计值"""
+
+    def extract_metric(metric_name: str, prefix: str) -> dict[str, float]:
         metric_data = pooled_metrics.get(metric_name, {})
         return {
-            f"{prefix}_mean": metric_data.get("mean", 0),
-            f"{prefix}_min": metric_data.get("min", 0),
-            f"{prefix}_max": metric_data.get("max", 0),
-            f"{prefix}_harmonic_mean": metric_data.get("harmonic_mean", 0),
+            f"{prefix}_mean": metric_data.get("mean", 0.0),
+            f"{prefix}_min": metric_data.get("min", 0.0),
+            f"{prefix}_max": metric_data.get("max", 0.0),
+            f"{prefix}_harmonic_mean": metric_data.get("harmonic_mean", 0.0),
         }
-    
-    scores = {}
-    # VMAF
+
+    scores: dict[str, float] = {}
     scores.update(extract_metric("vmaf", "vmaf"))
-    # PSNR-HVS
     scores.update(extract_metric("psnr_hvs", "psnr_hvs"))
-    # SSIM (vmaf 输出为 float_ssim)
     scores.update(extract_metric("float_ssim", "ssim"))
-    # MS-SSIM (vmaf 输出为 float_ms_ssim)
     scores.update(extract_metric("float_ms_ssim", "ms_ssim"))
-    
     return scores
 
 
 def get_video_resolution(video_path: str) -> tuple[int, int]:
     """获取视频分辨率"""
     cmd = [
-        "ffprobe", "-v", "quiet",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=width,height",
-        "-of", "json",
-        video_path
+        "ffprobe",
+        "-v",
+        "quiet",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-of",
+        "json",
+        video_path,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"无法获取视频分辨率: {result.stderr}")
-    
+    result = run_command(cmd, timeout_seconds=60, context="获取视频分辨率")
     data = json.loads(result.stdout)
     stream = data.get("streams", [{}])[0]
-    return stream.get("width", 0), stream.get("height", 0)
+    return int(stream.get("width", 0)), int(stream.get("height", 0))
 
 
-def calculate_snr(reference_path: str, distorted_path: str) -> dict:
+def _kill_process(proc: subprocess.Popen[Any]) -> None:
+    if proc.poll() is None:
+        proc.kill()
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _snr_zeros() -> dict[str, float]:
+    return {
+        "snr_mean": 0.0,
+        "snr_min": 0.0,
+        "snr_max": 0.0,
+        "snr_harmonic_mean": 0.0,
+    }
+
+
+def calculate_snr(
+    reference_path: str,
+    distorted_path: str,
+    *,
+    timeout_seconds: int = DEFAULT_SNR_TIMEOUT_SECONDS,
+) -> dict[str, float]:
     """
-    计算 SNR (Signal-to-Noise Ratio)
-    
-    使用灰度帧逐帧计算 SNR，然后汇总统计值
-    
-    返回: SNR 统计字典 (mean, min, max, harmonic_mean)
+    计算 SNR (Signal-to-Noise Ratio)。
+
+    使用灰度帧逐帧计算 SNR，并增加整体超时控制避免任务挂死。
     """
     width, height = get_video_resolution(reference_path)
     if width == 0 or height == 0:
         raise RuntimeError("无法获取视频分辨率")
-    
-    # 使用 ffmpeg 提取灰度帧数据
+
     ref_cmd = [
-        "ffmpeg", "-i", reference_path,
-        "-f", "rawvideo", "-pix_fmt", "gray",
-        "-"
+        *_ffmpeg_common_prefix(),
+        "-i",
+        reference_path,
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "gray",
+        "-",
     ]
     dist_cmd = [
-        "ffmpeg", "-i", distorted_path,
-        "-f", "rawvideo", "-pix_fmt", "gray",
-        "-"
+        *_ffmpeg_common_prefix(),
+        "-i",
+        distorted_path,
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "gray",
+        "-",
     ]
-    
+
     ref_proc = subprocess.Popen(
         ref_cmd,
         stdout=subprocess.PIPE,
@@ -278,49 +402,73 @@ def calculate_snr(reference_path: str, distorted_path: str) -> dict:
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
     )
-    
+
+    if ref_proc.stdout is None or dist_proc.stdout is None:
+        _kill_process(ref_proc)
+        _kill_process(dist_proc)
+        raise RuntimeError("SNR 计算初始化失败：无法打开视频流")
+
     frame_size = width * height
-    snr_values = []
-    
-    while True:
-        ref_data = ref_proc.stdout.read(frame_size)
-        dist_data = dist_proc.stdout.read(frame_size)
-        
-        if len(ref_data) < frame_size or len(dist_data) < frame_size:
-            break
-        
-        # 转换为 numpy 数组
-        ref_frame = np.frombuffer(ref_data, dtype=np.uint8).astype(np.float64)
-        dist_frame = np.frombuffer(dist_data, dtype=np.uint8).astype(np.float64)
-        
-        # 计算信号功率和噪声功率
-        signal_power = np.mean(ref_frame ** 2)
-        noise = ref_frame - dist_frame
-        noise_power = np.mean(noise ** 2)
-        
-        # 避免除以零
-        if noise_power > 0:
-            snr_db = 10 * np.log10(signal_power / noise_power)
-        else:
-            snr_db = 100.0  # 无噪声，设为高值
-        
-        snr_values.append(snr_db)
-    
-    ref_proc.wait()
-    dist_proc.wait()
-    
+    chunk_size = max(8192, min(frame_size, 1024 * 1024))
+    snr_values: list[float] = []
+    buffers = {"ref": bytearray(), "dist": bytearray()}
+    finished = {"ref": False, "dist": False}
+    started = time.monotonic()
+
+    selector = selectors.DefaultSelector()
+    ref_fd = ref_proc.stdout.fileno()
+    dist_fd = dist_proc.stdout.fileno()
+    os.set_blocking(ref_fd, False)
+    os.set_blocking(dist_fd, False)
+    selector.register(ref_fd, selectors.EVENT_READ, data="ref")
+    selector.register(dist_fd, selectors.EVENT_READ, data="dist")
+
+    try:
+        while True:
+            if time.monotonic() - started > timeout_seconds:
+                raise TimeoutError(f"SNR 计算超时（>{timeout_seconds}s）")
+
+            events = selector.select(timeout=0.5)
+            for key, _ in events:
+                stream_name = key.data
+                chunk = os.read(key.fd, chunk_size)
+                if not chunk:
+                    finished[stream_name] = True
+                    selector.unregister(key.fd)
+                    continue
+                buffers[stream_name].extend(chunk)
+
+            while len(buffers["ref"]) >= frame_size and len(buffers["dist"]) >= frame_size:
+                ref_data = bytes(buffers["ref"][:frame_size])
+                dist_data = bytes(buffers["dist"][:frame_size])
+                del buffers["ref"][:frame_size]
+                del buffers["dist"][:frame_size]
+
+                ref_frame = np.frombuffer(ref_data, dtype=np.uint8).astype(np.float64)
+                dist_frame = np.frombuffer(dist_data, dtype=np.uint8).astype(np.float64)
+
+                signal_power = np.mean(ref_frame ** 2)
+                noise_power = np.mean((ref_frame - dist_frame) ** 2)
+                snr_db = 10 * np.log10(signal_power / noise_power) if noise_power > 0 else 100.0
+                snr_values.append(float(snr_db))
+
+            if finished["ref"] and finished["dist"]:
+                break
+    finally:
+        selector.close()
+        _kill_process(ref_proc)
+        _kill_process(dist_proc)
+
     if not snr_values:
         raise RuntimeError("无法计算 SNR：没有有效帧")
-    
-    snr_array = np.array(snr_values)
-    
-    # 计算调和平均值（过滤无穷值）
+
+    snr_array = np.array(snr_values, dtype=np.float64)
     finite_snr = snr_array[np.isfinite(snr_array)]
     if len(finite_snr) > 0 and np.all(finite_snr > 0):
         harmonic_mean = len(finite_snr) / np.sum(1.0 / finite_snr)
     else:
-        harmonic_mean = np.mean(finite_snr) if len(finite_snr) > 0 else 0
-    
+        harmonic_mean = np.mean(finite_snr) if len(finite_snr) > 0 else 0.0
+
     return {
         "snr_mean": float(np.mean(snr_array)),
         "snr_min": float(np.min(snr_array)),
@@ -374,42 +522,44 @@ def run_single_benchmark(
     """
     config = ENCODERS[encoder_key]
     input_name = Path(input_path).stem
-    
-    # 输出文件路径
+    warnings: list[str] = []
+
     output_filename = f"{input_name}_{encoder_key}_{config.param_name}{param_value}.mp4"
     output_path = os.path.join(output_dir, "encoded", output_filename)
-    vmaf_json = os.path.join(output_dir, f"vmaf_{encoder_key}_{config.param_name}{param_value}.json")
-    
-    # 确保目录存在
+    vmaf_json = os.path.join(
+        output_dir, f"vmaf_{encoder_key}_{config.param_name}{param_value}.json"
+    )
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    
+
     print(f"  编码中: {config.name}, {config.param_name}={param_value}")
-    
-    # 编码
     encode_time = encode_video(input_path, output_path, encoder_key, param_value)
-    
-    # 获取文件大小
+
     input_size = os.path.getsize(input_path) / (1024 * 1024)
     output_size = os.path.getsize(output_path) / (1024 * 1024)
-    
-    print(f"  计算质量指标 (VMAF/PSNR-HVS/SSIM/MS-SSIM)...")
-    
-    # 计算 VMAF 及相关指标
+
+    print("  计算质量指标 (VMAF/PSNR-HVS/SSIM/MS-SSIM)...")
     vmaf_result = calculate_vmaf(input_path, output_path, vmaf_json)
     all_scores = extract_vmaf_scores(vmaf_result)
-    
-    print(f"  计算 SNR...")
-    
-    # 计算 SNR
-    snr_scores = calculate_snr(input_path, output_path)
+
+    print("  计算 SNR...")
+    try:
+        snr_scores = calculate_snr(input_path, output_path)
+    except Exception as exc:  # noqa: BLE001
+        if strict_mode:
+            raise RuntimeError(f"SNR 计算失败: {exc}") from exc
+        warning = f"SNR 计算失败，已按 no-strict 降级处理: {exc}"
+        warnings.append(warning)
+        snr_scores = _snr_zeros()
     all_scores.update(snr_scores)
-    
-    # 严格模式：验证所有指标
+
     if strict_mode:
         required_metrics = ["vmaf", "psnr_hvs", "ssim", "ms_ssim", "snr"]
         validate_metrics(all_scores, required_metrics)
-        print(f"  ✓ 所有指标计算完成")
-    
+        print("  ✓ 所有指标计算完成")
+    elif warnings:
+        print(f"  ⚠ {warnings[-1]}")
+
+    compression_ratio = round(output_size / input_size * 100, 2) if input_size > 0 else 0.0
     return BenchmarkResult(
         encoder=encoder_key,
         param_name=config.param_name,
@@ -418,8 +568,10 @@ def run_single_benchmark(
         output_file=output_path,
         input_size_mb=round(input_size, 2),
         output_size_mb=round(output_size, 2),
-        compression_ratio=round(output_size / input_size * 100, 2),
+        compression_ratio=compression_ratio,
         encode_time_seconds=round(encode_time, 2),
+        warnings=warnings or None,
+        error=None,
         **{k: round(v, 4) for k, v in all_scores.items()},
     )
 
@@ -445,16 +597,16 @@ def run_benchmark(
         评估结果列表
     """
     results = []
-    
+
     for encoder_key in encoders:
         if encoder_key not in ENCODERS:
             print(f"警告: 未知编码器 {encoder_key}，跳过")
             continue
-        
+
         config = ENCODERS[encoder_key]
         print(f"\n测试编码器: {config.name}")
         print(f"参数范围: {config.param_name} = {config.param_range[0]} ~ {config.param_range[1]}")
-        
+
         # 遍历参数范围
         for param_value in range(config.param_range[0], config.param_range[1] + 1, param_step):
             try:
@@ -462,13 +614,18 @@ def run_benchmark(
                     input_path, output_dir, encoder_key, param_value, strict_mode
                 )
                 results.append(result)
-                print(f"    VMAF: {result.vmaf_mean:.2f}, SSIM: {result.ssim_mean:.4f}, "
-                      f"SNR: {result.snr_mean:.2f} dB, 大小: {result.output_size_mb:.2f} MB")
+                summary = (
+                    f"    VMAF: {result.vmaf_mean:.2f}, SSIM: {result.ssim_mean:.4f}, "
+                    f"SNR: {result.snr_mean:.2f} dB, 大小: {result.output_size_mb:.2f} MB"
+                )
+                if result.warnings:
+                    summary += f", 警告: {result.warnings[-1]}"
+                print(summary)
             except Exception as e:
                 print(f"    错误: {e}")
                 if strict_mode:
                     raise  # 严格模式下，任何错误都停止
-    
+
     return results
 
 
@@ -479,18 +636,25 @@ def save_results(results: list[BenchmarkResult], output_path: str):
         "results": [asdict(r) for r in results],
     }
     
-    with open(output_path, "w") as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
-    
+
     print(f"\n结果已保存到: {output_path}")
 
 
 def load_results(input_path: str) -> list[BenchmarkResult]:
     """从 JSON 文件加载结果"""
-    with open(input_path, "r") as f:
+    with open(input_path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    
-    return [BenchmarkResult(**r) for r in data["results"]]
+
+    loaded: list[BenchmarkResult] = []
+    for result in data.get("results", []):
+        if "warnings" not in result:
+            result["warnings"] = None
+        if "error" not in result:
+            result["error"] = None
+        loaded.append(BenchmarkResult(**result))
+    return loaded
 
 
 def main():

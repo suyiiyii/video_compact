@@ -19,6 +19,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "示例:\n"
             "  python main.py benchmark video.mp4 -e hevc av1 -s 5\n"
+            "  python main.py autotune sample1.mp4 sample2.mp4 --target-vmaf 95\n"
             "  python main.py web --host 0.0.0.0 --port 8501"
         ),
         formatter_class=argparse.RawTextHelpFormatter,
@@ -83,6 +84,62 @@ def build_parser() -> argparse.ArgumentParser:
         help="是否启用无头模式（默认 true）",
     )
     web_parser.set_defaults(handler=cmd_web)
+
+    autotune_parser = subparsers.add_parser(
+        "autotune",
+        help="自动筛选推荐参数",
+        description="执行两阶段粗到细筛选，输出每视频每编码器推荐参数",
+    )
+    autotune_parser.add_argument(
+        "inputs",
+        nargs="+",
+        help="输入视频路径（可多个）",
+    )
+    autotune_parser.add_argument(
+        "--encoders",
+        "-e",
+        nargs="+",
+        default=["hevc", "av1"],
+        choices=list(SUPPORTED_ENCODERS),
+        help="要筛选的编码器",
+    )
+    autotune_parser.add_argument(
+        "--target-vmaf",
+        type=float,
+        default=95.0,
+        help="目标 VMAF 阈值（默认 95）",
+    )
+    autotune_parser.add_argument(
+        "--coarse-duration",
+        type=int,
+        default=10,
+        help="粗扫片段时长（秒，默认 10）",
+    )
+    autotune_parser.add_argument(
+        "--coarse-scale",
+        type=int,
+        default=1280,
+        help="粗扫缩放宽度（默认 1280）",
+    )
+    autotune_parser.add_argument(
+        "--output",
+        "-o",
+        default="results_autotune",
+        help="输出目录（默认 results_autotune）",
+    )
+    autotune_parser.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="并发任务数（默认 1）",
+    )
+    autotune_parser.add_argument(
+        "--strict",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="是否开启严格模式（默认 false）",
+    )
+    autotune_parser.set_defaults(handler=cmd_autotune)
 
     return parser
 
@@ -179,6 +236,83 @@ def cmd_web(args: argparse.Namespace) -> int:
         return 1
 
     return result.returncode
+
+
+def _print_autotune_progress(event: dict) -> None:
+    phase = event.get("phase", "unknown")
+    video = event.get("video", "-")
+    encoder = event.get("encoder")
+    crf = event.get("crf")
+    status = event.get("status")
+    message = event.get("message", "")
+
+    parts = [f"[{phase}]"]
+    if status:
+        parts.append(f"[{status}]")
+    parts.append(video)
+    if encoder:
+        parts.append(encoder)
+    if crf is not None:
+        parts.append(f"crf={crf}")
+    if message:
+        parts.append(f"- {message}")
+    print(" ".join(parts))
+
+
+def cmd_autotune(args: argparse.Namespace) -> int:
+    """自动筛选推荐参数。"""
+    missing_inputs = [p for p in args.inputs if not os.path.exists(p)]
+    if missing_inputs:
+        print("错误: 以下输入文件不存在:")
+        for path in missing_inputs:
+            print(f"  - {path}")
+        return 1
+    if args.jobs < 1:
+        print("错误: --jobs 必须 >= 1")
+        return 1
+    if args.coarse_duration < 1:
+        print("错误: --coarse-duration 必须 >= 1")
+        return 1
+    if args.coarse_scale < 16:
+        print("错误: --coarse-scale 必须 >= 16")
+        return 1
+
+    try:
+        from autotune import print_summary, run_autotune
+    except ModuleNotFoundError as exc:
+        print(f"错误: 缺少依赖，无法启动 autotune: {exc}")
+        print("请先安装项目依赖（例如 `uv sync` 或 `pip install -e .`）。")
+        return 1
+
+    print(f"输入视频数量: {len(args.inputs)}")
+    print(f"编码器: {', '.join(args.encoders)}")
+    print(f"目标 VMAF: {args.target_vmaf}")
+    print(f"粗扫时长: {args.coarse_duration}s")
+    print(f"粗扫缩放宽度: {args.coarse_scale}")
+    print(f"并发数: {args.jobs}")
+    print(f"严格模式: {'是' if args.strict else '否'}")
+    print(f"输出目录: {args.output}")
+
+    try:
+        summary = run_autotune(
+            inputs=args.inputs,
+            output_root=args.output,
+            encoders=args.encoders,
+            target_vmaf=args.target_vmaf,
+            coarse_duration=args.coarse_duration,
+            coarse_scale=args.coarse_scale,
+            strict_mode=args.strict,
+            jobs=args.jobs,
+            progress_cb=_print_autotune_progress,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"\n错误: autotune 执行失败: {exc}")
+        return 1
+
+    print_summary(summary)
+    if summary["stats"]["successful_recommendations"] == 0:
+        return 2
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
