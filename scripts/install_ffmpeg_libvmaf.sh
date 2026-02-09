@@ -2,7 +2,7 @@
 set -euo pipefail
 
 DEFAULT_TAG="autobuild-2026-02-08-12-58"
-DEFAULT_ASSET="ffmpeg-master-latest-linux64-gpl.tar.xz"
+DEFAULT_ASSET=""
 DEFAULT_DEST=".tools/ffmpeg-libvmaf"
 
 tag="${DEFAULT_TAG}"
@@ -18,7 +18,7 @@ Usage:
 
 Defaults:
   --tag    autobuild-2026-02-08-12-58
-  --asset  ffmpeg-master-latest-linux64-gpl.tar.xz
+  --asset  (optional) exact asset name in selected tag
   --dest   .tools/ffmpeg-libvmaf
 
 After install, export:
@@ -63,12 +63,64 @@ if [[ "$(uname -m)" != "x86_64" ]]; then
   exit 1
 fi
 
-base_url="https://github.com/BtbN/FFmpeg-Builds/releases/download/${tag}"
-asset_url="${base_url}/${asset}"
-checksums_url="${base_url}/checksums.sha256"
-
 tmp_dir="$(mktemp -d -t ffmpeg-libvmaf-XXXXXX)"
 trap 'rm -rf "${tmp_dir}"' EXIT
+
+mapfile -t release_info < <(python3 - "${tag}" "${asset}" <<'PY'
+import json
+import re
+import sys
+import urllib.request
+
+tag = sys.argv[1]
+requested_asset = sys.argv[2].strip()
+api = f"https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/tags/{tag}"
+with urllib.request.urlopen(api) as resp:
+    release = json.load(resp)
+
+assets = release.get("assets", [])
+if not assets:
+    raise SystemExit(f"No assets found for tag: {tag}")
+
+selected = None
+if requested_asset:
+    for item in assets:
+        if item.get("name") == requested_asset:
+            selected = item
+            break
+    if selected is None:
+        raise SystemExit(f"Asset not found in tag {tag}: {requested_asset}")
+else:
+    patterns = [
+        r"^ffmpeg-N-.*-linux64-gpl\.tar\.xz$",
+        r"^ffmpeg-master-latest-linux64-gpl\.tar\.xz$",
+        r".*-linux64-gpl\.tar\.xz$",
+    ]
+    for pattern in patterns:
+        for item in assets:
+            name = item.get("name", "")
+            if re.match(pattern, name):
+                selected = item
+                break
+        if selected is not None:
+            break
+    if selected is None:
+        raise SystemExit(f"No linux64 gpl tar.xz asset found in tag {tag}")
+
+checksums = next((a for a in assets if a.get("name") == "checksums.sha256"), None)
+checksums_url = checksums["browser_download_url"] if checksums else (
+    f"https://github.com/BtbN/FFmpeg-Builds/releases/download/{tag}/checksums.sha256"
+)
+
+print(selected["name"])
+print(selected["browser_download_url"])
+print(checksums_url)
+PY
+)
+
+asset="${release_info[0]}"
+asset_url="${release_info[1]}"
+checksums_url="${release_info[2]}"
 
 echo "Downloading ${asset_url}"
 curl -fsSL "${asset_url}" -o "${tmp_dir}/${asset}"

@@ -49,7 +49,6 @@ export VIDEO_COMPACT_FFPROBE_BIN=".../bin/ffprobe"
 ```bash
 ./scripts/install_ffmpeg_libvmaf.sh \
   --tag autobuild-2026-02-08-12-58 \
-  --asset ffmpeg-master-latest-linux64-gpl.tar.xz \
   --dest .tools/ffmpeg-libvmaf
 ```
 
