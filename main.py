@@ -12,14 +12,32 @@ SUPPORTED_ENCODERS = ("hevc", "av1")
 VMAF_IO_MODE_CHOICES = ("auto", "libvmaf", "fifo", "file")
 
 
-def _default_vmaf_threads() -> int:
-    raw = os.getenv("VIDEO_COMPACT_VMAF_THREADS")
+def _read_positive_int_env(key: str, default: int) -> int:
+    raw = os.getenv(key)
     if raw is None:
-        return max(1, os.cpu_count() or 1)
+        return max(1, default)
     try:
         return max(1, int(raw))
     except ValueError:
-        return max(1, os.cpu_count() or 1)
+        return max(1, default)
+
+
+DEFAULT_AUTO_VMAF_THREADS_CAP = _read_positive_int_env(
+    "VIDEO_COMPACT_AUTO_VMAF_THREADS_CAP",
+    8,
+)
+
+
+def _default_vmaf_threads() -> int:
+    raw = os.getenv("VIDEO_COMPACT_VMAF_THREADS")
+    if raw is None:
+        auto_value = max(1, (os.cpu_count() or 1) // 2)
+        return min(auto_value, DEFAULT_AUTO_VMAF_THREADS_CAP)
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        auto_value = max(1, (os.cpu_count() or 1) // 2)
+        return min(auto_value, DEFAULT_AUTO_VMAF_THREADS_CAP)
 
 
 DEFAULT_VMAF_THREADS = _default_vmaf_threads()
@@ -80,7 +98,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--vmaf-threads",
         type=int,
         default=DEFAULT_VMAF_THREADS,
-        help=f"VMAF 线程数（默认可用核数: {DEFAULT_VMAF_THREADS}）",
+        help=(
+            "VMAF 线程数 "
+            f"（默认: {DEFAULT_VMAF_THREADS}，可通过 VIDEO_COMPACT_AUTO_VMAF_THREADS_CAP 调整上限）"
+        ),
     )
     benchmark_parser.add_argument(
         "--vmaf-io-mode",
@@ -172,7 +193,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--vmaf-threads",
         type=int,
         default=DEFAULT_VMAF_THREADS,
-        help=f"VMAF 线程数（默认可用核数: {DEFAULT_VMAF_THREADS}）",
+        help=(
+            "VMAF 线程数 "
+            f"（默认: {DEFAULT_VMAF_THREADS}，可通过 VIDEO_COMPACT_AUTO_VMAF_THREADS_CAP 调整上限）"
+        ),
     )
     autotune_parser.add_argument(
         "--vmaf-io-mode",

@@ -823,11 +823,16 @@ else:
         )
         jobs = st.number_input("并发任务数", min_value=1, max_value=8, value=1)
         strict_mode = st.checkbox("严格模式", value=False)
+        try:
+            auto_cap = max(1, int(os.getenv("VIDEO_COMPACT_AUTO_VMAF_THREADS_CAP", "8")))
+        except ValueError:
+            auto_cap = 8
+        default_vmaf_threads = min(max(1, (os.cpu_count() or 1) // 2), auto_cap)
         vmaf_threads = st.number_input(
             "VMAF 线程数",
             min_value=1,
             max_value=max(1, os.cpu_count() or 1),
-            value=max(1, os.cpu_count() or 1),
+            value=default_vmaf_threads,
         )
         vmaf_io_mode = st.selectbox(
             "VMAF I/O 模式",

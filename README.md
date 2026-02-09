@@ -88,7 +88,7 @@ uv run python main.py autotune sample1.mp4 sample2.mp4 --vmaf-io-mode libvmaf
 - 精扫范围：
   - HEVC: 粗扫最优 `±2`
   - AV1: 粗扫最优 `±3`
-- VMAF 线程：默认取当前进程可用 CPU 核数（可用 `--vmaf-threads` 覆盖）
+- VMAF 线程：默认取 `min(可用核数/2, 8)`（可用 `--vmaf-threads` 覆盖，或用 `VIDEO_COMPACT_AUTO_VMAF_THREADS_CAP` 调整上限）
 - VMAF I/O：默认 `auto`（优先 `libvmaf`，失败后回退 `fifo`，最后回退 `file`）
 
 ### 3) 启动可视化

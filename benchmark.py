@@ -36,6 +36,22 @@ FFMPEG_BIN = os.getenv("VIDEO_COMPACT_FFMPEG_BIN", "ffmpeg").strip() or "ffmpeg"
 FFPROBE_BIN = os.getenv("VIDEO_COMPACT_FFPROBE_BIN", "ffprobe").strip() or "ffprobe"
 
 
+def _read_positive_int_env(key: str, default: int) -> int:
+    raw = os.getenv(key)
+    if raw is None:
+        return max(1, default)
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return max(1, default)
+
+
+DEFAULT_AUTO_VMAF_THREADS_CAP = _read_positive_int_env(
+    "VIDEO_COMPACT_AUTO_VMAF_THREADS_CAP",
+    8,
+)
+
+
 def _available_cpu_count() -> int:
     """获取当前进程可用 CPU 数量。"""
     try:
@@ -50,11 +66,14 @@ def _available_cpu_count() -> int:
 def _resolve_default_vmaf_threads() -> int:
     raw = os.getenv("VIDEO_COMPACT_VMAF_THREADS")
     if raw is None:
-        return max(1, _available_cpu_count())
+        # 默认做保守限制：半核并发，且封顶，降低 4K 场景 OOM 风险。
+        auto_value = max(1, _available_cpu_count() // 2)
+        return min(auto_value, DEFAULT_AUTO_VMAF_THREADS_CAP)
     try:
         return max(1, int(raw))
     except ValueError:
-        return max(1, _available_cpu_count())
+        auto_value = max(1, _available_cpu_count() // 2)
+        return min(auto_value, DEFAULT_AUTO_VMAF_THREADS_CAP)
 
 
 DEFAULT_VMAF_THREADS = _resolve_default_vmaf_threads()
@@ -1023,7 +1042,10 @@ def main():
         "--vmaf-threads",
         type=int,
         default=DEFAULT_VMAF_THREADS,
-        help=f"VMAF 线程数（默认可用核数: {DEFAULT_VMAF_THREADS}）",
+        help=(
+            "VMAF 线程数 "
+            f"（默认: {DEFAULT_VMAF_THREADS}，可通过 VIDEO_COMPACT_AUTO_VMAF_THREADS_CAP 调整上限）"
+        ),
     )
     parser.add_argument(
         "--vmaf-io-mode",
