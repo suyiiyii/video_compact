@@ -831,7 +831,7 @@ else:
         )
         vmaf_io_mode = st.selectbox(
             "VMAF I/O 模式",
-            ["auto", "fifo", "file"],
+            ["auto", "libvmaf", "fifo", "file"],
             index=0,
         )
 

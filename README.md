@@ -12,7 +12,8 @@
 ## 环境要求
 
 - Python `>=3.12`
-- 系统命令：`ffmpeg`、`ffprobe`、`vmaf`
+- 系统命令：`ffmpeg`、`ffprobe`
+- 若使用 `fifo/file` 模式，还需要 `vmaf` CLI
 
 ## 安装依赖
 
@@ -28,6 +29,36 @@ uv sync
 pip install -e .
 ```
 
+## 可复现 FFmpeg(libvmaf) 安装
+
+推荐使用仓库内脚本下载并校验一个已启用 `libvmaf` 的静态 FFmpeg：
+
+```bash
+./scripts/install_ffmpeg_libvmaf.sh
+```
+
+脚本会校验 SHA256，并输出可直接使用的环境变量：
+
+```bash
+export VIDEO_COMPACT_FFMPEG_BIN=".../bin/ffmpeg"
+export VIDEO_COMPACT_FFPROBE_BIN=".../bin/ffprobe"
+```
+
+可选参数：
+
+```bash
+./scripts/install_ffmpeg_libvmaf.sh \
+  --tag autobuild-2026-02-08-12-58 \
+  --asset ffmpeg-master-latest-linux64-gpl.tar.xz \
+  --dest .tools/ffmpeg-libvmaf
+```
+
+安装后可验证：
+
+```bash
+"$VIDEO_COMPACT_FFMPEG_BIN" -hide_banner -filters | grep libvmaf
+```
+
 ## 使用方式
 
 ### 1) 运行评估
@@ -37,6 +68,7 @@ uv run python main.py benchmark video.mp4
 uv run python main.py benchmark video.mp4 -e hevc av1 -s 5 -o results
 uv run python main.py benchmark video.mp4 --no-strict
 uv run python main.py benchmark video.mp4 --vmaf-threads 24 --vmaf-io-mode fifo
+uv run python main.py benchmark video.mp4 --vmaf-io-mode libvmaf
 ```
 
 ### 2) 自动筛选参数
@@ -45,6 +77,7 @@ uv run python main.py benchmark video.mp4 --vmaf-threads 24 --vmaf-io-mode fifo
 uv run python main.py autotune sample1.mp4 sample2.mp4
 uv run python main.py autotune sample1.mp4 sample2.mp4 --target-vmaf 95 --coarse-duration 10 --coarse-scale 1280 --jobs 2
 uv run python main.py autotune sample1.mp4 sample2.mp4 --vmaf-threads 24 --vmaf-io-mode auto
+uv run python main.py autotune sample1.mp4 sample2.mp4 --vmaf-io-mode libvmaf
 ```
 
 默认策略：
@@ -57,7 +90,7 @@ uv run python main.py autotune sample1.mp4 sample2.mp4 --vmaf-threads 24 --vmaf-
   - HEVC: 粗扫最优 `±2`
   - AV1: 粗扫最优 `±3`
 - VMAF 线程：默认取当前进程可用 CPU 核数（可用 `--vmaf-threads` 覆盖）
-- VMAF I/O：默认 `auto`（优先 FIFO 管道，不落盘；失败自动回退 `file`）
+- VMAF I/O：默认 `auto`（优先 `libvmaf`，失败后回退 `fifo`，最后回退 `file`）
 
 ### 3) 启动可视化
 

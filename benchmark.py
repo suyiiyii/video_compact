@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import selectors
@@ -29,7 +30,10 @@ from typing import Any
 
 import numpy as np
 
-VMAF_IO_MODES = {"auto", "fifo", "file"}
+VMAF_IO_MODES = {"auto", "libvmaf", "fifo", "file"}
+
+FFMPEG_BIN = os.getenv("VIDEO_COMPACT_FFMPEG_BIN", "ffmpeg").strip() or "ffmpeg"
+FFPROBE_BIN = os.getenv("VIDEO_COMPACT_FFPROBE_BIN", "ffprobe").strip() or "ffprobe"
 
 
 def _available_cpu_count() -> int:
@@ -184,13 +188,13 @@ def run_command(
 
 
 def _ffmpeg_common_prefix() -> list[str]:
-    return ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+    return [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y"]
 
 
 def get_video_info(video_path: str) -> dict[str, Any]:
     """获取视频信息"""
     cmd = [
-        "ffprobe",
+        FFPROBE_BIN,
         "-v",
         "quiet",
         "-print_format",
@@ -299,6 +303,27 @@ def _build_vmaf_command(
     ]
 
 
+def _escape_ffmpeg_filter_value(value: str) -> str:
+    escaped = value.replace("\\", "\\\\")
+    escaped = escaped.replace(":", "\\:")
+    escaped = escaped.replace("'", "\\'")
+    return escaped
+
+
+@functools.lru_cache(maxsize=8)
+def _supports_ffmpeg_libvmaf(ffmpeg_bin: str) -> bool:
+    try:
+        result = run_command(
+            [ffmpeg_bin, "-hide_banner", "-filters"],
+            timeout_seconds=30,
+            context=f"探测 ffmpeg libvmaf 支持（{ffmpeg_bin}）",
+        )
+    except CommandExecutionError:
+        return False
+    text = (result.stdout or "") + "\n" + (result.stderr or "")
+    return "libvmaf" in text
+
+
 def _collect_process_output(proc: subprocess.Popen[Any]) -> tuple[str, str]:
     try:
         stdout, stderr = proc.communicate(timeout=0.1)
@@ -306,6 +331,50 @@ def _collect_process_output(proc: subprocess.Popen[Any]) -> tuple[str, str]:
         _kill_process(proc)
         stdout, stderr = proc.communicate()
     return (stdout or "", stderr or "")
+
+
+def _run_vmaf_via_ffmpeg_libvmaf(
+    reference_path: str,
+    distorted_path: str,
+    output_json: str,
+    *,
+    vmaf_threads: int,
+    vmaf_timeout_seconds: int,
+) -> None:
+    if not _supports_ffmpeg_libvmaf(FFMPEG_BIN):
+        raise CommandExecutionError(
+            f"当前 ffmpeg 不支持 libvmaf 过滤器: {FFMPEG_BIN} "
+            "(请切换到带 --enable-libvmaf 的 ffmpeg)"
+        )
+
+    log_path = _escape_ffmpeg_filter_value(output_json)
+    thread_value = max(1, vmaf_threads)
+    libvmaf_expr = (
+        f"libvmaf=log_fmt=json:log_path='{log_path}':n_threads={thread_value}:"
+        "feature=name=psnr_hvs|name=float_ssim|name=float_ms_ssim"
+    )
+    filter_graph = (
+        "[0:v]settb=AVTB,setpts=PTS-STARTPTS[dist];"
+        "[1:v]settb=AVTB,setpts=PTS-STARTPTS[ref];"
+        f"[dist][ref]{libvmaf_expr}"
+    )
+    cmd = [
+        *_ffmpeg_common_prefix(),
+        "-i",
+        distorted_path,
+        "-i",
+        reference_path,
+        "-lavfi",
+        filter_graph,
+        "-f",
+        "null",
+        "-",
+    ]
+    run_command(
+        cmd,
+        timeout_seconds=vmaf_timeout_seconds,
+        context="FFmpeg libvmaf 计算",
+    )
 
 
 def _run_vmaf_via_files(
@@ -476,6 +545,12 @@ def calculate_vmaf(
     """
     以受控流程计算 VMAF 及相关指标。
 
+    I/O 模式:
+    - libvmaf: 直接使用 FFmpeg libvmaf（无中间 y4m）
+    - fifo: vmaf CLI + 命名管道
+    - file: vmaf CLI + 临时 y4m 文件
+    - auto: libvmaf -> fifo -> file 自动回退
+
     计算指标:
     - VMAF
     - PSNR-HVS
@@ -484,6 +559,23 @@ def calculate_vmaf(
     """
     _ensure_parent_dir(output_json)
     mode = _normalize_vmaf_io_mode(io_mode)
+
+    if mode in {"auto", "libvmaf"}:
+        try:
+            _run_vmaf_via_ffmpeg_libvmaf(
+                reference_path,
+                distorted_path,
+                output_json,
+                vmaf_threads=vmaf_threads,
+                vmaf_timeout_seconds=vmaf_timeout_seconds,
+            )
+            with open(output_json, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except CommandExecutionError as exc:
+            if mode == "libvmaf":
+                raise
+            if warnings is not None:
+                warnings.append(f"VMAF libvmaf 模式失败，尝试 FIFO 模式: {exc}")
 
     if mode in {"auto", "fifo"}:
         try:
@@ -498,7 +590,7 @@ def calculate_vmaf(
             if mode == "fifo":
                 raise
             if warnings is not None:
-                warnings.append(f"VMAF FIFO 模式失败，已回退文件模式: {exc}")
+                warnings.append(f"VMAF FIFO 模式失败，尝试文件模式: {exc}")
             _run_vmaf_via_files(
                 reference_path,
                 distorted_path,
@@ -546,7 +638,7 @@ def extract_vmaf_scores(vmaf_result: dict[str, Any]) -> dict[str, float]:
 def get_video_resolution(video_path: str) -> tuple[int, int]:
     """获取视频分辨率"""
     cmd = [
-        "ffprobe",
+        FFPROBE_BIN,
         "-v",
         "quiet",
         "-select_streams",
@@ -937,7 +1029,7 @@ def main():
         "--vmaf-io-mode",
         default=DEFAULT_VMAF_IO_MODE,
         choices=sorted(VMAF_IO_MODES),
-        help="VMAF 输入模式：auto(优先FIFO)、fifo(仅管道)、file(落盘Y4M)",
+        help="VMAF 输入模式：auto(优先libvmaf)、libvmaf(FFmpeg滤镜)、fifo(仅管道)、file(落盘Y4M)",
     )
     
     args = parser.parse_args()

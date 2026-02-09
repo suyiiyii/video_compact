@@ -9,7 +9,7 @@ import subprocess
 from pathlib import Path
 
 SUPPORTED_ENCODERS = ("hevc", "av1")
-VMAF_IO_MODE_CHOICES = ("auto", "fifo", "file")
+VMAF_IO_MODE_CHOICES = ("auto", "libvmaf", "fifo", "file")
 
 
 def _default_vmaf_threads() -> int:
@@ -86,7 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--vmaf-io-mode",
         default=DEFAULT_VMAF_IO_MODE,
         choices=VMAF_IO_MODE_CHOICES,
-        help="VMAF 输入模式：auto(优先FIFO)、fifo(仅管道)、file(落盘Y4M)",
+        help="VMAF 输入模式：auto(优先libvmaf)、libvmaf(FFmpeg滤镜)、fifo(仅管道)、file(落盘Y4M)",
     )
     benchmark_parser.set_defaults(handler=cmd_benchmark)
 
@@ -178,7 +178,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--vmaf-io-mode",
         default=DEFAULT_VMAF_IO_MODE,
         choices=VMAF_IO_MODE_CHOICES,
-        help="VMAF 输入模式：auto(优先FIFO)、fifo(仅管道)、file(落盘Y4M)",
+        help="VMAF 输入模式：auto(优先libvmaf)、libvmaf(FFmpeg滤镜)、fifo(仅管道)、file(落盘Y4M)",
     )
     autotune_parser.set_defaults(handler=cmd_autotune)
 
