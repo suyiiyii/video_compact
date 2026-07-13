@@ -75,6 +75,8 @@ uv run python main.py benchmark video.mp4 --vmaf-io-mode libvmaf
 ```bash
 uv run python main.py autotune sample1.mp4 sample2.mp4
 uv run python main.py autotune sample1.mp4 sample2.mp4 --target-vmaf 95 --coarse-duration 10 --coarse-scale 1280 --jobs 2
+uv run python main.py autotune sample1.mp4 sample2.mp4 --search-mode interpolate
+uv run python main.py autotune sample1.mp4 sample2.mp4 --search-mode grid
 uv run python main.py autotune sample1.mp4 sample2.mp4 --vmaf-threads 24 --vmaf-io-mode auto
 uv run python main.py autotune sample1.mp4 sample2.mp4 --vmaf-io-mode libvmaf
 ```
@@ -82,12 +84,18 @@ uv run python main.py autotune sample1.mp4 sample2.mp4 --vmaf-io-mode libvmaf
 默认策略：
 
 - 目标 VMAF：`95`
-- 粗扫网格：
-  - HEVC: `22,26,30,34`
-  - AV1: `30,36,42,48`
-- 精扫范围：
-  - HEVC: 粗扫最优 `±2`
-  - AV1: 粗扫最优 `±3`
+- 搜索策略：`interpolate`
+  - 锚点：
+    - HEVC: `16,22`
+    - AV1: `15,24`
+  - 插值估算目标 CRF，随后按估算值做 `±1` 验证
+- 可选策略：`grid`
+  - 粗扫网格：
+    - HEVC: `22,26,30,34`
+    - AV1: `30,36,42,48`
+  - 精扫范围：
+    - HEVC: 粗扫最优 `±2`
+    - AV1: 粗扫最优 `±3`
 - VMAF 线程：默认取 `min(可用核数/2, 8)`（可用 `--vmaf-threads` 覆盖，或用 `VIDEO_COMPACT_AUTO_VMAF_THREADS_CAP` 调整上限）
 - VMAF I/O：默认 `auto`（优先 `libvmaf`，失败后回退 `fifo`，最后回退 `file`）
 

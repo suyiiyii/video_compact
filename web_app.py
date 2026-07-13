@@ -497,6 +497,7 @@ def start_autotune_task(
     coarse_scale: int,
     output_root: str,
     jobs: int,
+    search_mode: str,
     strict_mode: bool,
     vmaf_threads: int,
     vmaf_io_mode: str,
@@ -522,6 +523,8 @@ def start_autotune_task(
         output_root,
         "--jobs",
         str(jobs),
+        "--search-mode",
+        search_mode,
         "--strict" if strict_mode else "--no-strict",
         "--vmaf-threads",
         str(vmaf_threads),
@@ -822,6 +825,12 @@ else:
             format_func=lambda x: ENCODERS[x].name,
         )
         jobs = st.number_input("并发任务数", min_value=1, max_value=8, value=1)
+        search_mode = st.selectbox(
+            "搜索策略",
+            ["interpolate", "grid"],
+            index=0,
+            help="interpolate 更快（两点估算+验证），grid 为完整粗扫+精扫",
+        )
         strict_mode = st.checkbox("严格模式", value=False)
         try:
             auto_cap = max(1, int(os.getenv("VIDEO_COMPACT_AUTO_VMAF_THREADS_CAP", "8")))
@@ -853,6 +862,7 @@ else:
             coarse_scale=int(coarse_scale),
             output_root=output_root,
             jobs=int(jobs),
+            search_mode=search_mode,
             strict_mode=strict_mode,
             vmaf_threads=int(vmaf_threads),
             vmaf_io_mode=vmaf_io_mode,

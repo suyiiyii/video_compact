@@ -1,4 +1,9 @@
-from autotune import build_fine_grid, rank_candidates, select_best_candidate
+from autotune import (
+    build_fine_grid,
+    estimate_target_crf_by_interpolation,
+    rank_candidates,
+    select_best_candidate,
+)
 
 
 def test_select_best_candidate_prefers_smallest_size_when_target_met():
@@ -46,3 +51,20 @@ def test_build_fine_grid_av1_with_boundaries():
     # av1 range is [25, 50], fine span is ±3
     grid = build_fine_grid("av1", 49)
     assert grid == [46, 47, 48, 49, 50]
+
+
+def test_estimate_target_crf_by_interpolation_prefers_threshold_brackets():
+    candidates = [
+        {"status": "ok", "crf": 22, "vmaf_mean": 97.0, "output_size_mb": 10.0},
+        {"status": "ok", "crf": 28, "vmaf_mean": 91.0, "output_size_mb": 6.0},
+    ]
+    assert estimate_target_crf_by_interpolation(candidates, 95.0, "hevc") == 24
+
+
+def test_estimate_target_crf_by_interpolation_clamps_to_encoder_range():
+    candidates = [
+        {"status": "ok", "crf": 16, "vmaf_mean": 99.0, "output_size_mb": 10.0},
+        {"status": "ok", "crf": 22, "vmaf_mean": 98.0, "output_size_mb": 6.0},
+    ]
+    # 线性外推会得到大于 HEVC 上限的值，结果应被夹在 [20,35]
+    assert estimate_target_crf_by_interpolation(candidates, 95.0, "hevc") == 35

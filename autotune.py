@@ -27,10 +27,17 @@ COARSE_GRID: dict[str, list[int]] = {
     "av1": [30, 36, 42, 48],
 }
 
+INTERPOLATION_ANCHORS: dict[str, list[int]] = {
+    "hevc": [16, 22],
+    "av1": [15, 24],
+}
+
 FINE_SPAN: dict[str, int] = {
     "hevc": 2,
     "av1": 3,
 }
+
+SEARCH_MODES = {"grid", "interpolate"}
 
 
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -65,6 +72,66 @@ def build_fine_grid(encoder: str, coarse_best_crf: int) -> list[int]:
     min_crf, max_crf = ENCODERS[encoder].param_range
     values = range(coarse_best_crf - span, coarse_best_crf + span + 1)
     return sorted({v for v in values if min_crf <= v <= max_crf})
+
+
+def estimate_target_crf_by_interpolation(
+    candidates: list[dict[str, Any]],
+    target_vmaf: float,
+    encoder: str,
+) -> int | None:
+    """
+    基于已有点位做线性插值估算目标 CRF。
+
+    优先使用阈值两侧最近点，若没有跨阈值点，则使用 CRF 两端点估算。
+    """
+    if encoder not in ENCODERS:
+        raise ValueError(f"未知编码器: {encoder}")
+    ok_candidates = [c for c in candidates if c.get("status") == "ok"]
+    if len(ok_candidates) < 2:
+        return None
+
+    sorted_by_crf = sorted(ok_candidates, key=lambda c: float(c["crf"]))
+    above = [c for c in sorted_by_crf if float(c["vmaf_mean"]) >= target_vmaf]
+    below = [c for c in sorted_by_crf if float(c["vmaf_mean"]) < target_vmaf]
+    if above and below:
+        point_a = min(above, key=lambda c: abs(float(c["vmaf_mean"]) - target_vmaf))
+        point_b = min(below, key=lambda c: abs(float(c["vmaf_mean"]) - target_vmaf))
+    else:
+        point_a = sorted_by_crf[0]
+        point_b = sorted_by_crf[-1]
+
+    crf_a = float(point_a["crf"])
+    crf_b = float(point_b["crf"])
+    vmaf_a = float(point_a["vmaf_mean"])
+    vmaf_b = float(point_b["vmaf_mean"])
+    if abs(vmaf_a - vmaf_b) < 1e-9:
+        return None
+
+    estimated = crf_a + ((vmaf_a - target_vmaf) / (vmaf_a - vmaf_b)) * (crf_b - crf_a)
+    min_crf, max_crf = ENCODERS[encoder].param_range
+    estimated_int = int(round(estimated))
+    return min(max(estimated_int, min_crf), max_crf)
+
+
+def _find_ok_candidate_by_crf(candidates: list[dict[str, Any]], crf: int) -> dict[str, Any] | None:
+    for candidate in candidates:
+        if candidate.get("status") != "ok":
+            continue
+        if int(candidate.get("crf", -1)) == crf:
+            return candidate
+    return None
+
+
+def _has_crf(candidates: list[dict[str, Any]], crf: int) -> bool:
+    return any(int(candidate.get("crf", -1)) == crf for candidate in candidates)
+
+
+def _neighbor_crf(encoder: str, crf: int, *, meets_target: bool) -> int | None:
+    min_crf, max_crf = ENCODERS[encoder].param_range
+    candidate = crf + (1 if meets_target else -1)
+    if candidate < min_crf or candidate > max_crf:
+        return None
+    return candidate
 
 
 def _to_candidate(stage: str, result: BenchmarkResult) -> dict[str, Any]:
@@ -352,6 +419,7 @@ def run_autotune(
     strict_mode: bool = False,
     vmaf_threads: int = DEFAULT_VMAF_THREADS,
     vmaf_io_mode: str = DEFAULT_VMAF_IO_MODE,
+    search_mode: str = "interpolate",
     jobs: int = 1,
     progress_cb: ProgressCallback | None = None,
 ) -> dict[str, Any]:
@@ -369,26 +437,39 @@ def run_autotune(
     if normalized_mode not in VMAF_IO_MODES:
         raise ValueError(f"不支持的 vmaf_io_mode: {vmaf_io_mode}")
     vmaf_io_mode = normalized_mode
+    normalized_search_mode = search_mode.strip().lower()
+    if normalized_search_mode not in SEARCH_MODES:
+        raise ValueError(f"不支持的 search_mode: {search_mode}")
+    search_mode = normalized_search_mode
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     run_dir = Path(output_root) / f"run_{timestamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    config: dict[str, Any] = {
+        "encoders": encoders,
+        "coarse_duration": coarse_duration,
+        "coarse_scale": coarse_scale,
+        "strict_mode": strict_mode,
+        "vmaf_threads": vmaf_threads,
+        "vmaf_io_mode": vmaf_io_mode,
+        "search_mode": search_mode,
+        "jobs": jobs,
+    }
+    if search_mode == "grid":
+        config["coarse_grid"] = {k: v for k, v in COARSE_GRID.items() if k in encoders}
+        config["fine_span"] = {k: v for k, v in FINE_SPAN.items() if k in encoders}
+    else:
+        config["interpolation_anchors"] = {
+            k: v for k, v in INTERPOLATION_ANCHORS.items() if k in encoders
+        }
+        config["interpolation_neighbor_step"] = 1
+
     summary: dict[str, Any] = {
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "target_vmaf": target_vmaf,
         "output_dir": str(run_dir),
-        "config": {
-            "encoders": encoders,
-            "coarse_duration": coarse_duration,
-            "coarse_scale": coarse_scale,
-            "strict_mode": strict_mode,
-            "vmaf_threads": vmaf_threads,
-            "vmaf_io_mode": vmaf_io_mode,
-            "jobs": jobs,
-            "coarse_grid": {k: v for k, v in COARSE_GRID.items() if k in encoders},
-            "fine_span": {k: v for k, v in FINE_SPAN.items() if k in encoders},
-        },
+        "config": config,
         "videos": [],
     }
 
@@ -445,45 +526,181 @@ def run_autotune(
             encoder_dir = sample_dir / encoder
             coarse_dir = str(encoder_dir / "coarse")
             fine_dir = str(encoder_dir / "fine")
-
-            coarse_candidates = _run_stage(
-                stage="coarse",
-                video_path=input_path,
-                input_path=coarse_clip_path,
-                output_dir=coarse_dir,
-                encoder=encoder,
-                crf_values=COARSE_GRID[encoder],
-                strict_mode=strict_mode,
-                vmaf_threads=vmaf_threads,
-                vmaf_io_mode=vmaf_io_mode,
-                jobs=jobs,
-                progress_cb=progress_cb,
-            )
-            coarse_ranked = rank_candidates(coarse_candidates, target_vmaf)
-            coarse_best, coarse_unmet = select_best_candidate(coarse_candidates, target_vmaf)
-
+            coarse_candidates: list[dict[str, Any]] = []
+            coarse_ranked: list[dict[str, Any]] = []
+            coarse_best: dict[str, Any] | None = None
+            coarse_unmet = True
             fine_candidates: list[dict[str, Any]] = []
             fine_ranked: list[dict[str, Any]] = []
             fine_best: dict[str, Any] | None = None
             fine_unmet = True
+            coarse_grid_values: list[int] = []
             fine_grid: list[int] = []
-            if coarse_best:
-                fine_grid = build_fine_grid(encoder, int(coarse_best["crf"]))
-                fine_candidates = _run_stage(
-                    stage="fine",
+            strategy_meta: dict[str, Any] = {"mode": search_mode}
+
+            if search_mode == "grid":
+                coarse_grid_values = COARSE_GRID[encoder]
+                coarse_candidates = _run_stage(
+                    stage="coarse",
                     video_path=input_path,
-                    input_path=input_path,
-                    output_dir=fine_dir,
+                    input_path=coarse_clip_path,
+                    output_dir=coarse_dir,
                     encoder=encoder,
-                    crf_values=fine_grid,
+                    crf_values=coarse_grid_values,
                     strict_mode=strict_mode,
                     vmaf_threads=vmaf_threads,
                     vmaf_io_mode=vmaf_io_mode,
                     jobs=jobs,
                     progress_cb=progress_cb,
                 )
-                fine_ranked = rank_candidates(fine_candidates, target_vmaf)
-                fine_best, fine_unmet = select_best_candidate(fine_candidates, target_vmaf)
+                coarse_ranked = rank_candidates(coarse_candidates, target_vmaf)
+                coarse_best, coarse_unmet = select_best_candidate(coarse_candidates, target_vmaf)
+
+                if coarse_best:
+                    fine_grid = build_fine_grid(encoder, int(coarse_best["crf"]))
+                    fine_candidates = _run_stage(
+                        stage="fine",
+                        video_path=input_path,
+                        input_path=input_path,
+                        output_dir=fine_dir,
+                        encoder=encoder,
+                        crf_values=fine_grid,
+                        strict_mode=strict_mode,
+                        vmaf_threads=vmaf_threads,
+                        vmaf_io_mode=vmaf_io_mode,
+                        jobs=jobs,
+                        progress_cb=progress_cb,
+                    )
+                    fine_ranked = rank_candidates(fine_candidates, target_vmaf)
+                    fine_best, fine_unmet = select_best_candidate(fine_candidates, target_vmaf)
+            else:
+                anchor_grid = INTERPOLATION_ANCHORS[encoder]
+                coarse_candidates = _run_stage(
+                    stage="coarse_anchor",
+                    video_path=input_path,
+                    input_path=coarse_clip_path,
+                    output_dir=coarse_dir,
+                    encoder=encoder,
+                    crf_values=anchor_grid,
+                    strict_mode=strict_mode,
+                    vmaf_threads=vmaf_threads,
+                    vmaf_io_mode=vmaf_io_mode,
+                    jobs=jobs,
+                    progress_cb=progress_cb,
+                )
+
+                estimated_crf = estimate_target_crf_by_interpolation(
+                    coarse_candidates,
+                    target_vmaf,
+                    encoder,
+                )
+                if estimated_crf is None:
+                    anchor_best, _ = select_best_candidate(coarse_candidates, target_vmaf)
+                    if anchor_best:
+                        estimated_crf = int(anchor_best["crf"])
+
+                if estimated_crf is not None and not _has_crf(coarse_candidates, estimated_crf):
+                    coarse_candidates.extend(
+                        _run_stage(
+                            stage="coarse_estimate",
+                            video_path=input_path,
+                            input_path=coarse_clip_path,
+                            output_dir=coarse_dir,
+                            encoder=encoder,
+                            crf_values=[estimated_crf],
+                            strict_mode=strict_mode,
+                            vmaf_threads=vmaf_threads,
+                            vmaf_io_mode=vmaf_io_mode,
+                            jobs=jobs,
+                            progress_cb=progress_cb,
+                        )
+                    )
+
+                estimated_candidate = None
+                if estimated_crf is not None:
+                    estimated_candidate = _find_ok_candidate_by_crf(coarse_candidates, estimated_crf)
+                if estimated_candidate and estimated_crf is not None:
+                    coarse_meets_target = float(estimated_candidate["vmaf_mean"]) >= target_vmaf
+                    probe_crf = _neighbor_crf(
+                        encoder,
+                        estimated_crf,
+                        meets_target=coarse_meets_target,
+                    )
+                    if probe_crf is not None and not _has_crf(coarse_candidates, probe_crf):
+                        coarse_candidates.extend(
+                            _run_stage(
+                                stage="coarse_probe",
+                                video_path=input_path,
+                                input_path=coarse_clip_path,
+                                output_dir=coarse_dir,
+                                encoder=encoder,
+                                crf_values=[probe_crf],
+                                strict_mode=strict_mode,
+                                vmaf_threads=vmaf_threads,
+                                vmaf_io_mode=vmaf_io_mode,
+                                jobs=jobs,
+                                progress_cb=progress_cb,
+                            )
+                        )
+
+                coarse_grid_values = sorted(
+                    {int(candidate["crf"]) for candidate in coarse_candidates if "crf" in candidate}
+                )
+                coarse_ranked = rank_candidates(coarse_candidates, target_vmaf)
+                coarse_best, coarse_unmet = select_best_candidate(coarse_candidates, target_vmaf)
+
+                if coarse_best:
+                    base_crf = int(coarse_best["crf"])
+                    fine_grid = [base_crf]
+                    fine_candidates.extend(
+                        _run_stage(
+                            stage="fine_base",
+                            video_path=input_path,
+                            input_path=input_path,
+                            output_dir=fine_dir,
+                            encoder=encoder,
+                            crf_values=[base_crf],
+                            strict_mode=strict_mode,
+                            vmaf_threads=vmaf_threads,
+                            vmaf_io_mode=vmaf_io_mode,
+                            jobs=jobs,
+                            progress_cb=progress_cb,
+                        )
+                    )
+                    base_candidate = _find_ok_candidate_by_crf(fine_candidates, base_crf)
+                    if base_candidate:
+                        base_meets_target = float(base_candidate["vmaf_mean"]) >= target_vmaf
+                        fine_probe = _neighbor_crf(
+                            encoder,
+                            base_crf,
+                            meets_target=base_meets_target,
+                        )
+                        if fine_probe is not None and not _has_crf(fine_candidates, fine_probe):
+                            fine_grid.append(fine_probe)
+                            fine_candidates.extend(
+                                _run_stage(
+                                    stage="fine_probe",
+                                    video_path=input_path,
+                                    input_path=input_path,
+                                    output_dir=fine_dir,
+                                    encoder=encoder,
+                                    crf_values=[fine_probe],
+                                    strict_mode=strict_mode,
+                                    vmaf_threads=vmaf_threads,
+                                    vmaf_io_mode=vmaf_io_mode,
+                                    jobs=jobs,
+                                    progress_cb=progress_cb,
+                                )
+                            )
+                    fine_ranked = rank_candidates(fine_candidates, target_vmaf)
+                    fine_best, fine_unmet = select_best_candidate(fine_candidates, target_vmaf)
+
+                strategy_meta.update(
+                    {
+                        "anchor_grid": anchor_grid,
+                        "estimated_crf": estimated_crf,
+                    }
+                )
 
             final_choice = fine_best or coarse_best
             threshold_unmet = fine_unmet if fine_best else coarse_unmet
@@ -505,7 +722,7 @@ def run_autotune(
 
             video_entry["encoders"][encoder] = {
                 "coarse": {
-                    "grid": COARSE_GRID[encoder],
+                    "grid": coarse_grid_values,
                     "candidates": coarse_candidates,
                     "ranked": coarse_ranked,
                     "best": coarse_best,
@@ -518,6 +735,7 @@ def run_autotune(
                     "best": fine_best,
                     "threshold_unmet": fine_unmet,
                 },
+                "strategy": strategy_meta,
                 "recommendation": recommendation,
             }
 

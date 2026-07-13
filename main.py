@@ -10,6 +10,7 @@ from pathlib import Path
 
 SUPPORTED_ENCODERS = ("hevc", "av1")
 VMAF_IO_MODE_CHOICES = ("auto", "libvmaf", "fifo", "file")
+SEARCH_MODE_CHOICES = ("interpolate", "grid")
 
 
 def _read_positive_int_env(key: str, default: int) -> int:
@@ -182,6 +183,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="并发任务数（默认 1）",
+    )
+    autotune_parser.add_argument(
+        "--search-mode",
+        default="interpolate",
+        choices=SEARCH_MODE_CHOICES,
+        help="搜索策略：interpolate(两点估算+验证) / grid(粗扫+精扫网格)",
     )
     autotune_parser.add_argument(
         "--strict",
@@ -358,6 +365,7 @@ def cmd_autotune(args: argparse.Namespace) -> int:
     print(f"目标 VMAF: {args.target_vmaf}")
     print(f"粗扫时长: {args.coarse_duration}s")
     print(f"粗扫缩放宽度: {args.coarse_scale}")
+    print(f"搜索策略: {args.search_mode}")
     print(f"并发数: {args.jobs}")
     print(f"严格模式: {'是' if args.strict else '否'}")
     print(f"VMAF 线程: {max(1, args.vmaf_threads)}")
@@ -375,6 +383,7 @@ def cmd_autotune(args: argparse.Namespace) -> int:
             strict_mode=args.strict,
             vmaf_threads=max(1, args.vmaf_threads),
             vmaf_io_mode=args.vmaf_io_mode,
+            search_mode=args.search_mode,
             jobs=args.jobs,
             progress_cb=_print_autotune_progress,
         )
